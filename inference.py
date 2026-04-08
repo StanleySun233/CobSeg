@@ -1,0 +1,522 @@
+import argparse
+import json
+import os
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import yaml
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import AutoModel, AutoTokenizer
+
+from model.base_model import BaseModel
+from model.bert_bilstm_dts import DualStreamSegmenter
+from model.bert_dts import PureBertSegmenter
+from utils.dialogue_dataset import DialogueDataset
+from utils.dts_data import (
+    EmbeddedDialogueDataset,
+    MAX_UTT_TOKENS,
+    MAX_UTTERANCES,
+    collate_fn,
+)
+from utils.dts_utils import (
+    dialogues_used_for_stream,
+    evaluate_all,
+    print_metrics,
+    run_checkpoint_dir,
+    save_sample_predictions,
+)
+from utils.utils import resolve_dataset_path
+
+
+@dataclass
+class ExperimentConfig:
+    model_name: str
+    dataset: str
+    encoder: str
+    emb_batch: int
+    epochs: int
+    batch_size: int
+    seed: int
+    lr: float
+    lr_patience: int
+    lr_factor: float
+    min_lr: float
+    early_stop: int
+    num_samples: int
+    eval_only: bool
+    exp_name: str
+    stream_mode: str
+    disable_token_transformer: bool
+    disable_crf: bool
+    disable_ubiw: bool
+    topic_json_path: str
+    rank_loss_weight: float
+    rank_margin: float
+    rank_kw_gap: float
+    end_loss_weight: float
+    start_loss_weight: float
+    edge_gate_alpha: float
+    edge_gate_gamma: float
+
+
+_DATASET_CFG_CACHE: dict = {}
+
+
+def _load_dataset_config(config_path: str) -> dict:
+    """Load dataset_config.yaml once and cache it."""
+    global _DATASET_CFG_CACHE
+    if config_path not in _DATASET_CFG_CACHE:
+        p = Path(config_path)
+        if p.exists():
+            with open(p) as f:
+                _DATASET_CFG_CACHE[config_path] = yaml.safe_load(f) or {}
+        else:
+            print(f"[warn] dataset_config not found: {config_path}  (using built-in defaults)")
+            _DATASET_CFG_CACHE[config_path] = {}
+    return _DATASET_CFG_CACHE[config_path]
+
+
+_DATASET_CONFIG_PATH = Path(__file__).resolve().parent / "data" / "dataset_config.yaml"
+
+
+def resolve_dataset_limits(dataset: str) -> tuple[int, int]:
+    """Return (max_utt_tokens, max_utterances) from data/dataset_config.yaml."""
+    ds_stem = Path(resolve_dataset_path(dataset)).stem
+    ds_cfg = _load_dataset_config(str(_DATASET_CONFIG_PATH)).get(ds_stem, {})
+    return (
+        int(ds_cfg.get("max_utt_tokens", MAX_UTT_TOKENS)),
+        int(ds_cfg.get("max_utterances",  MAX_UTTERANCES)),
+    )
+
+
+def compute_pos_weight(dataset: EmbeddedDialogueDataset) -> float:
+    total_neg, total_pos = 0, 0
+    for _, _, _, labels, _ in dataset.samples:
+        pos = labels.sum().item()
+        neg = len(labels) - pos
+        total_pos += pos
+        total_neg += neg
+    if total_pos == 0:
+        return 1.0
+    return total_neg / total_pos
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    use_crf: bool,
+    rank_loss_weight: float = 0.0,
+    rank_margin: float = 0.1,
+    rank_kw_gap: float = 0.05,
+    end_loss_weight: float = 1.0,
+    start_loss_weight: float = 1.0,
+    grad_clip: float = 1.0,
+    epoch: int = 1,
+    epochs: int = 1,
+) -> float:
+    model.train()
+    total_loss = 0.0
+    pbar = tqdm(loader, desc=f"train {epoch}/{epochs}", leave=True, dynamic_ncols=True)
+    for step, batch in enumerate(pbar, start=1):
+        x_s, x_w, tok_m, labels, lengths, kw_scores = batch
+        x_s = x_s.to(device)
+        x_w = x_w.to(device)
+        tok_m = tok_m.to(device)
+        labels = labels.to(device)
+        kw_scores = kw_scores.to(device)
+
+        if hasattr(model, "forward_heads"):
+            emissions, end_emissions, start_emissions, mask = model.forward_heads(
+                x_s, x_w, tok_m, lengths, kw_scores=kw_scores
+            )
+        else:
+            emissions, mask = model(x_s, x_w, tok_m, lengths, kw_scores=kw_scores)
+            end_emissions = None
+            start_emissions = None
+        tags = labels.long().masked_fill(~mask, 0)
+        start_tags = torch.roll(tags, shifts=1, dims=1)
+        start_tags[:, 0] = 1
+        start_tags = start_tags.masked_fill(~mask, 0)
+
+        if use_crf:
+            loss = -model.crf(emissions, tags, mask=mask, reduction="mean")
+        else:
+            targets = tags.masked_fill(~mask, -100)
+            loss = nn.functional.cross_entropy(
+                emissions.view(-1, 2),
+                targets.view(-1),
+                ignore_index=-100,
+            )
+        if end_emissions is not None and start_emissions is not None:
+            end_targets = tags.masked_fill(~mask, -100)
+            start_targets = start_tags.masked_fill(~mask, -100)
+            loss_end = nn.functional.cross_entropy(
+                end_emissions.view(-1, 2),
+                end_targets.view(-1),
+                ignore_index=-100,
+            )
+            loss_start = nn.functional.cross_entropy(
+                start_emissions.view(-1, 2),
+                start_targets.view(-1),
+                ignore_index=-100,
+            )
+            loss = loss + end_loss_weight * loss_end + start_loss_weight * loss_start
+        if rank_loss_weight > 0:
+            probs = torch.softmax(emissions, dim=-1)[:, :, 1]
+            rank_terms = []
+            for i, length in enumerate(lengths.tolist()):
+                l = int(length)
+                if l <= 1:
+                    continue
+                p = probs[i, :l]
+                k = kw_scores[i, :l]
+                p_diff = p.unsqueeze(1) - p.unsqueeze(0)
+                k_diff = k.unsqueeze(1) - k.unsqueeze(0)
+                valid = k_diff > rank_kw_gap
+                if valid.any():
+                    rank_terms.append(torch.relu(rank_margin - p_diff[valid]).mean())
+            if rank_terms:
+                rank_loss = torch.stack(rank_terms).mean()
+                loss = loss + rank_loss_weight * rank_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+
+        total_loss += loss.item()
+        pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{total_loss / step:.4f}")
+
+    return total_loss / max(len(loader), 1)
+
+
+def predict(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    use_crf: bool,
+) -> tuple[list[list[int]], list[list[int]]]:
+    model.eval()
+    all_preds: list[list[int]] = []
+    all_labels: list[list[int]] = []
+
+    with torch.no_grad():
+        for x_s, x_w, tok_m, labels, lengths, kw_scores in loader:
+            x_s = x_s.to(device)
+            x_w = x_w.to(device)
+            tok_m = tok_m.to(device)
+            kw_scores = kw_scores.to(device)
+            emissions, mask = model(x_s, x_w, tok_m, lengths, kw_scores=kw_scores)
+
+            if use_crf:
+                batch_preds = model.crf.decode(emissions, mask=mask)
+            else:
+                pred_ids = emissions.argmax(dim=-1)
+                batch_preds = []
+                for i, length in enumerate(lengths.tolist()):
+                    batch_preds.append(pred_ids[i, :length].tolist())
+
+            for i, length in enumerate(lengths.tolist()):
+                pred = batch_preds[i][:length]
+                true = labels[i, :length].int().tolist()
+                all_preds.append(pred)
+                all_labels.append(true)
+
+    return all_preds, all_labels
+
+
+def build_model(cfg: ExperimentConfig, input_dim: int, max_utt_tokens: int) -> tuple[nn.Module, bool]:
+    if cfg.model_name == "bert_bilstm":
+        model = DualStreamSegmenter(
+            input_dim=input_dim,
+            max_utt_tokens=max_utt_tokens,
+            stream_mode=cfg.stream_mode,
+            use_token_transformer=not cfg.disable_token_transformer,
+            use_crf=not cfg.disable_crf,
+            use_ubiw=not cfg.disable_ubiw,
+            edge_gate_alpha=cfg.edge_gate_alpha,
+            edge_gate_gamma=cfg.edge_gate_gamma,
+            topic_json_path=cfg.topic_json_path,
+        )
+        return model, not cfg.disable_crf
+
+    if cfg.model_name == "bert":
+        model = PureBertSegmenter(input_dim=input_dim)
+        return model, False
+
+    raise ValueError(f"Unsupported model_name: {cfg.model_name}")
+
+
+def run_single(cfg: ExperimentConfig) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    # ── resolve per-dataset token / utterance limits from dataset_config.yaml ──
+    max_utt_tokens, max_utterances = resolve_dataset_limits(cfg.dataset)
+    print(f"Limits  max_utt_tokens={max_utt_tokens}  max_utterances={max_utterances}"
+          f"  (data/dataset_config.yaml)")
+
+    os.environ.setdefault("HF_HUB_READ_TIMEOUT", "120")
+
+    ds_path = resolve_dataset_path(cfg.dataset)
+    print(f"Loading dataset: {ds_path}")
+    ckpt_dir = run_checkpoint_dir(__file__, ds_path, cfg.exp_name)
+    print(f"Run checkpoint directory: {ckpt_dir}")
+
+    full_dataset = DialogueDataset(ds_path)
+    train_dialogues = [d for d in full_dataset if d.set == "train"]
+    val_dialogues = [d for d in full_dataset if d.set in ("valid", "val", "dev")]
+    test_dialogues = [d for d in full_dataset if d.set == "test"]
+    print(f"Train: {len(train_dialogues)}  Valid: {len(val_dialogues)}  Test: {len(test_dialogues)}")
+
+    print(f"Loading HF model: {cfg.encoder}")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.encoder, trust_remote_code=True, local_files_only=True)
+    enc_model = AutoModel.from_pretrained(cfg.encoder, trust_remote_code=True, local_files_only=True).to(device).eval()
+    topic_word_set = {}
+    if os.path.exists(cfg.topic_json_path):
+        with open(cfg.topic_json_path, "r", encoding="utf-8") as f:
+            topic_data = json.load(f)
+        topic_word_set = {
+            ds: set(info.get("all_top_words", []))
+            for ds, info in topic_data.items()
+        }
+        print(f"Loaded topic keywords from {cfg.topic_json_path}")
+
+    train_data = EmbeddedDialogueDataset(
+        train_dialogues,
+        enc_model,
+        tokenizer,
+        device,
+        batch_size=cfg.emb_batch,
+        max_utterances=max_utterances,
+        max_utt_tokens=max_utt_tokens,
+        dataset_name=cfg.dataset,
+        topic_word_set=topic_word_set,
+    )
+    test_data = EmbeddedDialogueDataset(
+        test_dialogues,
+        enc_model,
+        tokenizer,
+        device,
+        batch_size=cfg.emb_batch,
+        max_utterances=max_utterances,
+        max_utt_tokens=max_utt_tokens,
+        dataset_name=cfg.dataset,
+        topic_word_set=topic_word_set,
+    )
+
+    if not cfg.eval_only and len(train_data.samples) == 0:
+        raise SystemExit("No training dialogues after encoding.")
+
+    ref_data = train_data if train_data.samples else test_data
+    if not ref_data.samples:
+        raise SystemExit("No dialogues after encoding.")
+
+    input_dim = ref_data.samples[0][0].shape[-1]
+    token_len = ref_data.samples[0][1].shape[1]
+    if token_len != max_utt_tokens:
+        raise ValueError(f"token length {token_len} != max_utt_tokens {max_utt_tokens}")
+
+    train_loader = DataLoader(
+        train_data,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        collate_fn=lambda b: collate_fn(b, max_utterances=max_utterances),
+    )
+    test_loader = DataLoader(
+        test_data,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        collate_fn=lambda b: collate_fn(b, max_utterances=max_utterances),
+    )
+
+    val_loader = None
+    if val_dialogues:
+        val_data = EmbeddedDialogueDataset(
+            val_dialogues,
+            enc_model,
+            tokenizer,
+            device,
+            batch_size=cfg.emb_batch,
+            max_utterances=max_utterances,
+            max_utt_tokens=max_utt_tokens,
+            dataset_name=cfg.dataset,
+            topic_word_set=topic_word_set,
+        )
+        val_loader = DataLoader(
+            val_data,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            collate_fn=lambda b: collate_fn(b, max_utterances=max_utterances),
+        )
+
+    model, use_crf = build_model(cfg, input_dim=input_dim, max_utt_tokens=max_utt_tokens)
+    model = model.to(device)
+
+    if hasattr(model, "set_class_balance"):
+        pos_w = compute_pos_weight(train_data) if train_data.samples else 1.0
+        model.set_class_balance(pos_w)
+        print(f"Train token pos_weight (neg/pos): {pos_w:.4f}")
+
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {total_params:,}")
+
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / "best.pt"
+
+    if cfg.eval_only:
+        print(f"Loading checkpoint: {ckpt_path}")
+        load_res = model.load_state_dict(torch.load(ckpt_path, map_location=device), strict=False)
+        if hasattr(model, "sync_start_heads_from_end"):
+            if any(k.startswith("head_s_start") or k.startswith("head_w_start") for k in load_res.missing_keys):
+                model.sync_start_heads_from_end()
+        if val_loader is not None:
+            preds_v, labels_v = predict(model, val_loader, device, use_crf=use_crf)
+            print_metrics(evaluate_all(preds_v, labels_v), prefix="Val")
+        preds, labels = predict(model, test_loader, device, use_crf=use_crf)
+        print_metrics(evaluate_all(preds, labels), prefix="Test")
+        save_sample_predictions(
+            dialogues_used_for_stream(test_dialogues, max_utterances),
+            preds,
+            labels,
+            out_path=ckpt_dir / "sample_predictions.csv",
+            n=cfg.num_samples,
+            seed=cfg.seed,
+        )
+        return
+
+    if val_loader is None:
+        raise SystemExit("No valid/val/dev split found in dataset.")
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=cfg.lr_factor,
+        patience=cfg.lr_patience,
+        min_lr=cfg.min_lr,
+        verbose=True,
+    )
+
+    best_pk = float("inf")
+    epochs_no_improve = 0
+
+    for epoch in range(1, cfg.epochs + 1):
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            use_crf=use_crf,
+            rank_loss_weight=cfg.rank_loss_weight,
+            rank_margin=cfg.rank_margin,
+            rank_kw_gap=cfg.rank_kw_gap,
+            end_loss_weight=cfg.end_loss_weight,
+            start_loss_weight=cfg.start_loss_weight,
+            epoch=epoch,
+            epochs=cfg.epochs,
+        )
+
+        preds_v, labels_v = predict(model, val_loader, device, use_crf=use_crf)
+        metrics_val = evaluate_all(preds_v, labels_v)
+        scheduler.step(metrics_val["PK"])
+
+        print(
+            f"Epoch {epoch:3d}/{cfg.epochs}  loss={train_loss:.4f}  "
+            f"lr={optimizer.param_groups[0]['lr']:.2e}  ",
+            end="",
+        )
+        print_metrics(metrics_val, prefix="Val")
+
+        if metrics_val["PK"] < best_pk:
+            best_pk = metrics_val["PK"]
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"  ↳ Saved best checkpoint  (Val PK={best_pk:.4f})")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if cfg.early_stop > 0 and epochs_no_improve >= cfg.early_stop:
+            print(
+                f"Early stopping after {epochs_no_improve} epoch(s) "
+                f"without Val PK improvement (patience={cfg.early_stop})."
+            )
+            break
+
+    print("\n--- Final evaluation (best checkpoint) ---")
+    load_res = model.load_state_dict(torch.load(ckpt_path, map_location=device), strict=False)
+    if hasattr(model, "sync_start_heads_from_end"):
+        if any(k.startswith("head_s_start") or k.startswith("head_w_start") for k in load_res.missing_keys):
+            model.sync_start_heads_from_end()
+    preds_v, labels_v = predict(model, val_loader, device, use_crf=use_crf)
+    metrics_val = evaluate_all(preds_v, labels_v)
+    print_metrics(metrics_val, prefix="Val")
+    preds, labels = predict(model, test_loader, device, use_crf=use_crf)
+    metrics_test = evaluate_all(preds, labels)
+    print_metrics(metrics_test, prefix="Test")
+
+    results_path = ckpt_dir / "results.json"
+    with open(results_path, "w") as f:
+        json.dump({"config": asdict(cfg), "metrics_val": metrics_val, "metrics_test": metrics_test}, f, indent=2)
+    print(f"Results saved to {results_path}")
+
+    save_sample_predictions(
+        dialogues_used_for_stream(test_dialogues, max_utterances),
+        preds,
+        labels,
+        out_path=ckpt_dir / "sample_predictions.csv",
+        n=cfg.num_samples,
+        seed=cfg.seed,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="DTS training entry (unified)")
+    parser.add_argument("--model_name", default="bert_bilstm", choices=("bert_bilstm", "bert"))
+    parser.add_argument("--dataset", default="vhf")
+    parser.add_argument("--encoder", default="BAAI/bge-m3")
+    parser.add_argument("--emb_batch", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lr", type=float, default=BaseModel.default_lr)
+    parser.add_argument("--lr_patience", type=int, default=BaseModel.default_lr_patience)
+    parser.add_argument("--lr_factor", type=float, default=BaseModel.default_lr_factor)
+    parser.add_argument("--min_lr", type=float, default=BaseModel.default_min_lr)
+    parser.add_argument("--early_stop", type=int, default=BaseModel.default_early_stop)
+    parser.add_argument("--num_samples", type=int, default=-1)
+    parser.add_argument("--eval_only", action="store_true")
+    parser.add_argument("--exp_name", type=str, default="baseline")
+
+    parser.add_argument("--stream_mode", choices=("dual", "sentence", "token"), default="dual")
+    parser.add_argument("--disable_token_transformer", action="store_true")
+    parser.add_argument("--disable_crf", action="store_true")
+    parser.add_argument("--disable_ubiw", action="store_true")
+    parser.add_argument("--topic_json_path", type=str, default="./data/topic/topic_keywords.json")
+    parser.add_argument("--rank_loss_weight", type=float, default=0.2)
+    parser.add_argument("--rank_margin", type=float, default=0.1)
+    parser.add_argument("--rank_kw_gap", type=float, default=0.05)
+    parser.add_argument("--end_loss_weight", type=float, default=1.0)
+    parser.add_argument("--start_loss_weight", type=float, default=1.0)
+    parser.add_argument("--edge_gate_alpha", type=float, default=0.25)
+    parser.add_argument("--edge_gate_gamma", type=float, default=1.5)
+
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
+    cfg = ExperimentConfig(**vars(args))
+    run_single(cfg)
+
+
+if __name__ == "__main__":
+    main()
+

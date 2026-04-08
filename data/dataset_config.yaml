@@ -1,0 +1,31 @@
+# Per-dataset limits derived from BAAI/bge-m3 subword token counts (all splits).
+#
+# max_utt_tokens : token budget per utterance  → controls (B, U, L, D) tensor L dim
+# max_utterances : max utterances per dialogue  → controls (B, U, D) tensor U dim
+#
+# Selection criterion: smallest power-of-2 that covers ≥ 99 % of samples,
+# verified against the full distribution in scripts/analyse_lengths.py.
+#
+# Raw percentiles (bge-m3 subword tokens):
+#
+#   dataset     utt p50  utt p95  utt p99  utt p100   dial p50  dial p95  dial p99  dial p100
+#   vhf              21       33       40        75         49        67        70       112
+#   dialseg711       15       34       42       129         26        38        42        48
+#   doc2dial         15       45       64       180         13        16        18        32
+#
+# Coverage of chosen limits:
+#   vhf       max_utt_tokens=48  → 99.9 %   max_utterances=128 → 100 %
+#   dialseg711 max_utt_tokens=48 → 99.8 %   max_utterances=64  → 100 %
+#   doc2dial  max_utt_tokens=64  → 99.0 %   max_utterances=32  → 100 %
+
+vhf:
+  max_utt_tokens: 48
+  max_utterances: 128
+
+dialseg711:
+  max_utt_tokens: 48
+  max_utterances: 64
+
+doc2dial:
+  max_utt_tokens: 64
+  max_utterances: 32
