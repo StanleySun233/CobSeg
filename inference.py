@@ -557,7 +557,7 @@ def run_single(cfg: ExperimentConfig) -> None:
         min_lr=cfg.min_lr,
     )
 
-    best_pk = float("inf")
+    best_score = float("-inf")
     epochs_no_improve = 0
 
     for epoch in range(1, cfg.epochs + 1):
@@ -604,10 +604,10 @@ def run_single(cfg: ExperimentConfig) -> None:
         )
         print_metrics(metrics_val, prefix="Val")
 
-        if metrics_val["PK"] < best_pk:
-            best_pk = metrics_val["PK"]
+        if metrics_val["Score"] > best_score:
+            best_score = metrics_val["Score"]
             torch.save(model.state_dict(), ckpt_path)
-            print(f"  ↳ Saved best checkpoint  (Val PK={best_pk:.4f})")
+            print(f"  ↳ Saved best checkpoint  (Val Score={best_score:.4f})")
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
@@ -615,7 +615,7 @@ def run_single(cfg: ExperimentConfig) -> None:
         if cfg.early_stop > 0 and epochs_no_improve >= cfg.early_stop:
             print(
                 f"Early stopping after {epochs_no_improve} epoch(s) "
-                f"without Val PK improvement (patience={cfg.early_stop})."
+                f"without Val Score improvement (patience={cfg.early_stop})."
             )
             break
 

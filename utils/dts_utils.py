@@ -45,12 +45,18 @@ def evaluate_all(all_preds: list[list[int]], all_labels: list[list[int]]) -> dic
     precision = precision_score(all_true_flat, all_pred_flat, pos_label=1, zero_division=0)
     recall = recall_score(all_true_flat, all_pred_flat, pos_label=1, zero_division=0)
 
+    pk_mean = float(np.mean(pk_list))
+    wd_mean = float(np.mean(wd_list))
+    f1_mean = float(np.mean(f1_list))
+    score = (2 * f1_mean + (1 - pk_mean) + (1 - wd_mean)) / 4
+
     return {
-        "PK": float(np.mean(pk_list)),
-        "WD": float(np.mean(wd_list)),
-        "F1": float(np.mean(f1_list)),
+        "PK": pk_mean,
+        "WD": wd_mean,
+        "F1": f1_mean,
         "Precision": float(precision),
         "Recall": float(recall),
+        "Score": float(score),
     }
 
 
@@ -58,7 +64,8 @@ def print_metrics(metrics: dict, prefix: str = ""):
     tag = f"[{prefix}] " if prefix else ""
     print(
         f"{tag}PK={metrics['PK']:.4f}  WD={metrics['WD']:.4f}  "
-        f"F1={metrics['F1']:.4f}  P={metrics['Precision']:.4f}  R={metrics['Recall']:.4f}"
+        f"F1={metrics['F1']:.4f}  P={metrics['Precision']:.4f}  R={metrics['Recall']:.4f}  "
+        f"Score={metrics['Score']:.4f}"
     )
 
 
