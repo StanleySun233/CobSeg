@@ -31,6 +31,53 @@ def _build_kw_scores(
     return torch.tensor(scores, dtype=torch.float32)
 
 
+def topic_channel_sets_from_info(info: dict) -> dict[str, set[str]]:
+    legacy = set(info.get("all_top_words", []))
+    ae = info.get("keywords_ae")
+    bd = info.get("keywords_bd")
+    if not isinstance(ae, dict):
+        ae = {}
+    if not isinstance(bd, dict):
+        bd = {}
+    distinctive = set(ae.get("distinctive", []))
+    if not distinctive and legacy:
+        distinctive = set(legacy)
+    return {
+        "coh_salient": distinctive,
+        "coh_ambient": set(ae.get("ubiquitous", [])),
+        "bnd_core": set(bd.get("prototype", [])),
+        "bnd_marker": set(bd.get("boundary", [])),
+    }
+
+
+KW_COH_AMBIENT_W = 0.25
+KW_BND_CORE_PENALTY = 0.15
+
+
+def _build_kw_channel_scores(
+    utterances: list[str],
+    channels: dict[str, set[str]],
+) -> torch.Tensor:
+    d_set = channels.get("coh_salient", set())
+    u_set = channels.get("coh_ambient", set())
+    p_set = channels.get("bnd_core", set())
+    b_set = channels.get("bnd_marker", set())
+    t = len(utterances)
+    out = torch.zeros(t, 2, dtype=torch.float32)
+    for idx, utt in enumerate(utterances):
+        tokens = _tokenize(utt)
+        if not tokens:
+            continue
+        n = len(tokens)
+
+        def dens(st: set[str]) -> float:
+            return sum(1 for x in tokens if x in st) / n
+
+        out[idx, 0] = dens(d_set) + KW_COH_AMBIENT_W * dens(u_set)
+        out[idx, 1] = dens(b_set) - KW_BND_CORE_PENALTY * dens(p_set)
+    return out
+
+
 def mean_pool(last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
     summed = torch.sum(last_hidden * mask, dim=1)
@@ -89,13 +136,12 @@ class EmbeddedDialogueDataset(Dataset):
         max_utterances: int = MAX_UTTERANCES,
         max_utt_tokens: int = MAX_UTT_TOKENS,
         dataset_name: str = "",
-        topic_word_set: dict[str, set[str]] | None = None,
+        topic_channels: dict[str, set[str]] | None = None,
     ):
         self.max_utterances = max_utterances
         self.max_utt_tokens = max_utt_tokens
         self.samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        topic_word_set = topic_word_set or {}
-        keyword_set = topic_word_set.get(dataset_name, set())
+        channels = topic_channels or {}
 
         all_texts: list[str] = []
         meta: list[tuple[int, int]] = []
@@ -109,7 +155,7 @@ class EmbeddedDialogueDataset(Dataset):
                 continue
             full_b = segments_to_boundaries(dialogue.segments)
             labels_list.append(torch.tensor(full_b[:n], dtype=torch.float32))
-            kw_list.append(_build_kw_scores(utts, keyword_set))
+            kw_list.append(_build_kw_channel_scores(utts, channels))
             start = len(all_texts)
             all_texts.extend(utts)
             meta.append((start, n))
@@ -154,13 +200,16 @@ def collate_fn(batch, max_utterances: int = MAX_UTTERANCES):
     pad_w = torch.zeros(bsz, max_utterances, lt, d, dtype=torch.float32)
     pad_m = torch.zeros(bsz, max_utterances, lt, dtype=torch.float32)
     pad_y = torch.full((bsz, max_utterances), -1.0)
-    pad_kw = torch.zeros(bsz, max_utterances, dtype=torch.float32)
+    pad_kw = torch.zeros(bsz, max_utterances, 2, dtype=torch.float32)
     for i, (s, w, m, y, kw) in enumerate(zip(emb_s, emb_w, tok_m, labels, kw_scores)):
         t = int(lengths[i].item())
         pad_s[i, :t] = s
         pad_w[i, :t] = w
         pad_m[i, :t] = m
         pad_y[i, :t] = y
-        pad_kw[i, :t] = kw
+        if kw.dim() == 1:
+            pad_kw[i, :t, 0] = kw
+        else:
+            pad_kw[i, :t, :] = kw
     return pad_s, pad_w, pad_m, pad_y, lengths, pad_kw
 

@@ -13,7 +13,7 @@ Usage
 python scripts/visualise_ubiw.py \
     --dataset vhf \
     --dialogue_id 0 \
-    --exp_name kw_rank_v1 \
+    --exp_name topic_kw_v1 \
     --encoder BAAI/bge-m3
 """
 
@@ -37,7 +37,13 @@ from transformers import AutoModel, AutoTokenizer
 
 from utils.dialogue_dataset import DialogueDataset
 from utils.utils import resolve_dataset_path
-from utils.dts_data import encode_utterances_hf, _build_kw_scores, MAX_UTT_TOKENS, MAX_UTTERANCES
+from utils.dts_data import (
+    encode_utterances_hf,
+    _build_kw_channel_scores,
+    topic_channel_sets_from_info,
+    MAX_UTT_TOKENS,
+    MAX_UTTERANCES,
+)
 from utils.dts_utils import segments_to_boundaries
 from model.bert_bilstm_dts import DualStreamSegmenter
 
@@ -68,18 +74,18 @@ def _auto_ckpt(dataset: str, exp_name: str) -> Path:
     return ROOT / "checkpoints" / stem / exp_name / "best.pt"
 
 
-def _load_kw_set(topic_json_path: str, dataset: str) -> set:
+def _load_topic_channels(topic_json_path: str, dataset: str) -> dict[str, set[str]]:
     p = Path(topic_json_path)
     if not p.exists():
-        return set()
+        return topic_channel_sets_from_info({})
     with open(p) as f:
         topic_data = json.load(f)
     ds_path = resolve_dataset_path(dataset)
     stem = Path(ds_path).stem
     for key in (stem, dataset, dataset.lower()):
         if key in topic_data:
-            return set(topic_data[key].get("all_top_words", []))
-    return set()
+            return topic_channel_sets_from_info(topic_data[key])
+    return topic_channel_sets_from_info({})
 
 
 # ── token → word attribution ───────────────────────────────────────────────────
@@ -201,6 +207,17 @@ def _compute_word_attributions(
     return words_per_utt, word_attrs_per_utt
 
 
+def _distance_decay(boundaries: list[int], n: int, tau: float) -> np.ndarray:
+    if n <= 0:
+        return np.zeros(0, dtype=np.float32)
+    b = np.where(np.array(boundaries[:n], dtype=np.int64) == 1)[0]
+    if b.size == 0:
+        return np.ones(n, dtype=np.float32)
+    pos = np.arange(n, dtype=np.float32)[:, None]
+    dist = np.abs(pos - b[None, :]).min(axis=1)
+    return np.exp(-dist / max(float(tau), 1e-6)).astype(np.float32)
+
+
 # ── rendering ──────────────────────────────────────────────────────────────────
 
 _CMAP_TOK  = cm.get_cmap("YlOrRd")   # word attribution heat (yellow → red)
@@ -258,9 +275,8 @@ def _draw_word_row(
 
 def _plot(
     utts: list[str],
-    ubiw_raw: np.ndarray,
-    ubiw_disp: np.ndarray,
-    ubiw_disp_01: np.ndarray,
+    ubiw_end_disp_01: np.ndarray,
+    ubiw_start_disp_01: np.ndarray,
     ubiw_disp_label: str,
     words_per_utt: list[list[str]],
     word_attrs_per_utt: list[np.ndarray],
@@ -276,10 +292,10 @@ def _plot(
     row_h = max(0.32, min(0.55, 11.0 / n))
     fig_h = max(6.0, n * row_h + 2.5)
 
-    fig, (ax_tok, ax_ubiw) = plt.subplots(
-        1, 2,
+    fig, (ax_tok, ax_ubiw_end, ax_ubiw_start) = plt.subplots(
+        1, 3,
         figsize=(20, fig_h),
-        gridspec_kw={"width_ratios": [6, 1]},
+        gridspec_kw={"width_ratios": [6, 1, 1]},
         constrained_layout=True,
     )
 
@@ -358,28 +374,40 @@ def _plot(
     ubiw_cmap = _CMAP_UBIW
 
     for i in range(n):
-        v = float(ubiw_disp_01[i])
+        v = float(ubiw_end_disp_01[i])
         color = ubiw_cmap(ubiw_norm(v))
-        ax_ubiw.barh(i, v, color=color, height=0.75, align="center")
+        ax_ubiw_end.barh(i, v, color=color, height=0.75, align="center")
+    for i in range(n):
+        v = float(ubiw_start_disp_01[i])
+        color = ubiw_cmap(ubiw_norm(v))
+        ax_ubiw_start.barh(i, v, color=color, height=0.75, align="center")
 
     for i, b in enumerate(gt_boundaries):
         if b == 1:
-            ax_ubiw.axhline(y=i + 0.5, color="#1565C0", lw=2.0, ls="--", zorder=5)
+            ax_ubiw_end.axhline(y=i + 0.5, color="#1565C0", lw=2.0, ls="--", zorder=5)
+            ax_ubiw_start.axhline(y=i + 0.5, color="#1565C0", lw=2.0, ls="--", zorder=5)
     for i, b in enumerate(pred_boundaries):
         if b == 1:
-            ax_ubiw.axhline(y=i + 0.5, color="#C62828", lw=1.6, ls="-", zorder=6, alpha=0.88)
+            ax_ubiw_end.axhline(y=i + 0.5, color="#C62828", lw=1.6, ls="-", zorder=6, alpha=0.88)
+            ax_ubiw_start.axhline(y=i + 0.5, color="#C62828", lw=1.6, ls="-", zorder=6, alpha=0.88)
 
-    ax_ubiw.set_ylim(n - 0.5, -0.5)
-    ax_ubiw.set_yticks([])
-    ax_ubiw.set_xlim(0, 1.05)
-    ax_ubiw.set_xlabel(f"UBIW\n{ubiw_disp_label} (0-1)", fontsize=8)
+    ax_ubiw_end.set_ylim(n - 0.5, -0.5)
+    ax_ubiw_end.set_yticks([])
+    ax_ubiw_end.set_xlim(0, 1.05)
+    ax_ubiw_end.set_xlabel(f"UBIW end\n{ubiw_disp_label} (0-1)", fontsize=8)
+    ax_ubiw_end.set_title("UBIW End", fontsize=9)
+    ax_ubiw_end.tick_params(axis="x", labelsize=7)
+    ax_ubiw_start.set_ylim(n - 0.5, -0.5)
+    ax_ubiw_start.set_yticks([])
+    ax_ubiw_start.set_xlim(0, 1.05)
+    ax_ubiw_start.set_xlabel(f"UBIW start\n{ubiw_disp_label} (0-1)", fontsize=8)
+    ax_ubiw_start.set_title("UBIW Start", fontsize=9)
+    ax_ubiw_start.tick_params(axis="x", labelsize=7)
     cbar_label = f"UBIW {ubiw_disp_label} (min-max 0-1)"
-    ax_ubiw.set_title("UBIW", fontsize=9)
-    ax_ubiw.tick_params(axis="x", labelsize=7)
 
     sm_ubiw = plt.cm.ScalarMappable(cmap=ubiw_cmap, norm=ubiw_norm)
     sm_ubiw.set_array([])
-    cbar2 = fig.colorbar(sm_ubiw, ax=ax_ubiw, shrink=0.45, pad=0.04, aspect=22)
+    cbar2 = fig.colorbar(sm_ubiw, ax=[ax_ubiw_end, ax_ubiw_start], shrink=0.45, pad=0.04, aspect=22)
     cbar2.set_label(cbar_label, fontsize=7.5)
     cbar2.ax.tick_params(labelsize=7)
 
@@ -416,6 +444,8 @@ def main():
                         help="Output directory (default: scripts/output/)")
     parser.add_argument("--attr_target", choices=("cut", "end", "start"), default="cut")
     parser.add_argument("--ubiw_view", choices=("w", "delta_gain", "zscore"), default="delta_gain")
+    parser.add_argument("--token_decay", choices=("none", "gt", "pred"), default="gt")
+    parser.add_argument("--token_decay_tau", type=float, default=2.0)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -464,8 +494,8 @@ def main():
             args.max_utt_tokens = ckpt_max_utt_tokens
 
     # ── keyword scores ─────────────────────────────────────────────────────────
-    kw_set = _load_kw_set(args.topic_json_path, args.dataset)
-    kw_scores = _build_kw_scores(utts, kw_set).numpy()
+    kw_ch = _load_topic_channels(args.topic_json_path, args.dataset)
+    kw_scores = _build_kw_channel_scores(utts, kw_ch).numpy()
 
     # ── encode ─────────────────────────────────────────────────────────────────
     print(f"Loading encoder: {args.encoder}")
@@ -484,7 +514,7 @@ def main():
     x_s   = torch.tensor(sent_np,   dtype=torch.float32).unsqueeze(0).to(device)
     x_w   = torch.tensor(tok_np,    dtype=torch.float32).unsqueeze(0).to(device)
     tok_m = torch.tensor(mask_np,   dtype=torch.float32).unsqueeze(0).to(device)
-    kw_t  = torch.tensor(kw_scores, dtype=torch.float32).unsqueeze(0).to(device)
+    kw_t = torch.tensor(kw_scores, dtype=torch.float32).unsqueeze(0).to(device)
     lengths = torch.tensor([n], dtype=torch.long)
 
     # ── load model ─────────────────────────────────────────────────────────────
@@ -506,7 +536,11 @@ def main():
     # ── inference (UBIW weights + boundary predictions) ───────────────────────
     with torch.no_grad():
         emissions, mask = model(x_s, x_w, tok_m, lengths, kw_scores=kw_t)
-        ubiw_w = model.get_ubiw_weights(x_s, lengths)   # (1, T)
+        if hasattr(model, "get_ubiw_weights_dual"):
+            ubiw_end_w, ubiw_start_w = model.get_ubiw_weights_dual(x_s, lengths)
+        else:
+            ubiw_w = model.get_ubiw_weights(x_s, lengths)
+            ubiw_end_w, ubiw_start_w = ubiw_w, ubiw_w
 
     if model.crf is not None:
         pred_seq = model.crf.decode(emissions, mask=mask)[0]
@@ -514,29 +548,40 @@ def main():
         pred_seq = emissions[0].argmax(dim=-1).tolist()
 
     pred_boundaries = [int(p) for p in pred_seq[:n]]
-    ubiw = ubiw_w[0, :n].cpu().numpy()
-    ubiw_mean = float(ubiw.mean())
-    ubiw_std = float(ubiw.std())
-    ubiw_delta_gain = ubiw_strength_val * (ubiw - ubiw_mean)
-    if ubiw_std > 1e-9:
-        ubiw_z = (ubiw - ubiw_mean) / ubiw_std
-    else:
-        ubiw_z = np.zeros_like(ubiw)
+    ubiw_end = ubiw_end_w[0, :n].cpu().numpy()
+    ubiw_start = ubiw_start_w[0, :n].cpu().numpy()
+    ubiw = 0.5 * (ubiw_end + ubiw_start)
+
+    def _to_view(raw: np.ndarray, view: str):
+        v_mean = float(raw.mean())
+        v_std = float(raw.std())
+        v_delta_gain = ubiw_strength_val * (raw - v_mean)
+        if v_std > 1e-9:
+            v_z = (raw - v_mean) / v_std
+        else:
+            v_z = np.zeros_like(raw)
+        if view == "w":
+            disp = raw
+        elif view == "zscore":
+            disp = v_z
+        else:
+            disp = v_delta_gain
+        dmin = float(disp.min())
+        dmax = float(disp.max())
+        if dmax - dmin > 1e-9:
+            disp_01 = (disp - dmin) / (dmax - dmin)
+        else:
+            disp_01 = np.zeros_like(disp)
+        return disp, disp_01, v_delta_gain
+
+    ubiw_end_disp, ubiw_end_disp_01, ubiw_end_delta_gain = _to_view(ubiw_end, args.ubiw_view)
+    ubiw_start_disp, ubiw_start_disp_01, ubiw_start_delta_gain = _to_view(ubiw_start, args.ubiw_view)
     if args.ubiw_view == "w":
-        ubiw_disp = ubiw
         ubiw_disp_label = "w"
     elif args.ubiw_view == "zscore":
-        ubiw_disp = ubiw_z
         ubiw_disp_label = "z-score"
     else:
-        ubiw_disp = ubiw_delta_gain
         ubiw_disp_label = "delta_gain"
-    disp_min = float(ubiw_disp.min())
-    disp_max = float(ubiw_disp.max())
-    if disp_max - disp_min > 1e-9:
-        ubiw_disp_01 = (ubiw_disp - disp_min) / (disp_max - disp_min)
-    else:
-        ubiw_disp_01 = np.zeros_like(ubiw_disp)
 
     n_gt   = sum(gt_boundaries)
     n_pred = sum(pred_boundaries)
@@ -546,19 +591,28 @@ def main():
         f"mean={ubiw.mean():.3f}  std={ubiw.std():.3f}"
     )
     print(
-        f"UBIW delta_gain  min={ubiw_delta_gain.min():.6f}  max={ubiw_delta_gain.max():.6f}  "
-        f"mean={ubiw_delta_gain.mean():.6f}  std={ubiw_delta_gain.std():.6f}"
+        f"UBIW_end delta_gain  min={ubiw_end_delta_gain.min():.6f}  max={ubiw_end_delta_gain.max():.6f}  "
+        f"mean={ubiw_end_delta_gain.mean():.6f}  std={ubiw_end_delta_gain.std():.6f}"
     )
     print(
-        f"UBIW {ubiw_disp_label} -> [0,1]  min={ubiw_disp_01.min():.6f}  "
-        f"max={ubiw_disp_01.max():.6f}  mean={ubiw_disp_01.mean():.6f}  std={ubiw_disp_01.std():.6f}"
+        f"UBIW_start delta_gain  min={ubiw_start_delta_gain.min():.6f}  max={ubiw_start_delta_gain.max():.6f}  "
+        f"mean={ubiw_start_delta_gain.mean():.6f}  std={ubiw_start_delta_gain.std():.6f}"
+    )
+    print(
+        f"UBIW_end {ubiw_disp_label} -> [0,1]  min={ubiw_end_disp_01.min():.6f}  "
+        f"max={ubiw_end_disp_01.max():.6f}  mean={ubiw_end_disp_01.mean():.6f}  std={ubiw_end_disp_01.std():.6f}"
+    )
+    print(
+        f"UBIW_start {ubiw_disp_label} -> [0,1]  min={ubiw_start_disp_01.min():.6f}  "
+        f"max={ubiw_start_disp_01.max():.6f}  mean={ubiw_start_disp_01.mean():.6f}  std={ubiw_start_disp_01.std():.6f}"
     )
 
-    top5_idx = np.argsort(ubiw_disp)[::-1][:5]
-    print(f"Top-5 utterances by {ubiw_disp_label}:")
+    top5_idx = np.argsort(0.5 * (ubiw_end_disp + ubiw_start_disp))[::-1][:5]
+    print(f"Top-5 utterances by avg({ubiw_disp_label}_end, {ubiw_disp_label}_start):")
     for rank, idx in enumerate(top5_idx, 1):
         print(
-            f"  #{rank}  [utt {idx:02d}]  w={ubiw[idx]:.6f}  {ubiw_disp_label}={ubiw_disp[idx]:.6f}  "
+            f"  #{rank}  [utt {idx:02d}]  w_end={ubiw_end[idx]:.6f}  w_start={ubiw_start[idx]:.6f}  "
+            f"{ubiw_disp_label}_end={ubiw_end_disp[idx]:.6f}  {ubiw_disp_label}_start={ubiw_start_disp[idx]:.6f}  "
             f"gt={gt_boundaries[idx]}  pred={pred_boundaries[idx]}  "
             f"text={utts[idx][:70]!r}"
         )
@@ -571,14 +625,24 @@ def main():
         n, args.max_utt_tokens,
         attr_target=args.attr_target,
     )
+    if args.token_decay != "none":
+        if args.token_decay == "pred":
+            decay = _distance_decay(pred_boundaries, n, args.token_decay_tau)
+        else:
+            decay = _distance_decay(gt_boundaries, n, args.token_decay_tau)
+        for i in range(n):
+            word_attrs_per_utt[i] = np.clip(word_attrs_per_utt[i] * float(decay[i]), 0.0, 1.0)
+        print(
+            f"Token decay mode={args.token_decay} tau={args.token_decay_tau:.3f}  "
+            f"min={decay.min():.3f} max={decay.max():.3f} mean={decay.mean():.3f}"
+        )
 
     # ── plot ───────────────────────────────────────────────────────────────────
     out_dir = Path(args.out_dir) if args.out_dir else ROOT / "scripts" / "output"
     _plot(
         utts=utts,
-        ubiw_raw=ubiw,
-        ubiw_disp=ubiw_disp,
-        ubiw_disp_01=ubiw_disp_01,
+        ubiw_end_disp_01=ubiw_end_disp_01,
+        ubiw_start_disp_01=ubiw_start_disp_01,
         ubiw_disp_label=ubiw_disp_label,
         words_per_utt=words_per_utt,
         word_attrs_per_utt=word_attrs_per_utt,

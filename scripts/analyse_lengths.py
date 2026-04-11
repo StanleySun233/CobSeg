@@ -36,8 +36,17 @@ from utils.utils import resolve_dataset_path
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-DATASETS   = ["vhf", "dialseg711", "doc2dial"]
-COLOURS    = ["#1f77b4", "#ff7f0e", "#2ca02c"]
+DEFAULT_DATASETS = ["vhf", "dialseg711", "doc2dial"]
+COLOURS = [
+    "#1f77b4",
+    "#ff7f0e",
+    "#2ca02c",
+    "#d62728",
+    "#9467bd",
+    "#8c564b",
+    "#e377c2",
+    "#7f7f7f",
+]
 PCTS       = list(range(0, 101, 10))
 
 UTT_THRESHOLDS  = [32, 48, 64, 96, 128, 192, 256]
@@ -80,7 +89,7 @@ def _pct_row(arr: np.ndarray) -> list:
     return [round(float(np.percentile(arr, p))) for p in PCTS]
 
 
-def print_table(stats: dict):
+def print_table(stats: dict, dataset_names: list[str]):
     """Print the percentile table to stdout."""
     col_w = 6
     pct_header = "".join(f"{'p'+str(p):>{col_w}}" for p in PCTS)
@@ -96,7 +105,7 @@ def print_table(stats: dict):
     print(sep)
     print(header)
     print(sep)
-    for ds_name in DATASETS:
+    for ds_name in dataset_names:
         for metric, arr in [("utt_tok", stats[ds_name]["utt"]),
                             ("dial_utt", stats[ds_name]["dial"])]:
             row = _pct_row(arr)
@@ -107,7 +116,7 @@ def print_table(stats: dict):
     print(sep)
 
 
-def print_coverage(stats: dict):
+def print_coverage(stats: dict, dataset_names: list[str]):
     """For each dataset, show what % of samples fall within each threshold."""
     def cov(arr, thresh):
         return 100.0 * (arr <= thresh).sum() / len(arr)
@@ -120,18 +129,18 @@ def print_coverage(stats: dict):
         th_header = "".join(f"{'@'+str(t):>7}" for t in thresholds)
         print(f"  {metric}   {th_header}")
         print("  " + "─" * (14 + 7 * len(thresholds)))
-        for ds_name in DATASETS:
+        for ds_name in dataset_names:
             arr = stats[ds_name]["utt" if metric == "utt_tok" else "dial"]
             vals = "".join(f"{cov(arr, t):>6.1f}%" for t in thresholds)
             print(f"  {ds_name:<12s}{vals}")
         print()
 
 
-def print_recommendations(stats: dict):
+def print_recommendations(stats: dict, dataset_names: list[str]):
     """Recommend max_utt_tokens and max_utterances per dataset."""
     print("=== Recommended per-dataset limits (p95, ceil to power-of-2) ===")
     print()
-    for ds_name in DATASETS:
+    for ds_name in dataset_names:
         u95 = int(np.percentile(stats[ds_name]["utt"],  95))
         d95 = int(np.percentile(stats[ds_name]["dial"], 95))
         rec_tok = _ceil_pow2(u95)
@@ -153,7 +162,7 @@ def _cdf(arr: np.ndarray, xmax: float):
     return x, y
 
 
-def make_figure(stats: dict, out_path: Path, token_label: str):
+def make_figure(stats: dict, out_path: Path, token_label: str, dataset_names: list[str]):
     """Four-panel figure: CDF × 2 (top) + percentile bar chart × 2 (bottom)."""
     fig, axes = plt.subplots(
         2, 2, figsize=(14, 9),
@@ -161,12 +170,14 @@ def make_figure(stats: dict, out_path: Path, token_label: str):
     )
     (ax_utt_cdf, ax_dial_cdf), (ax_utt_bar, ax_dial_bar) = axes
 
-    bar_x   = np.arange(len(PCTS))
-    bar_w   = 0.26
-    offsets = [-bar_w, 0, bar_w]
+    bar_x = np.arange(len(PCTS))
+    n_ds = len(dataset_names)
+    bar_w = min(0.28, 0.8 / max(n_ds, 1))
+    offsets = [(i - (n_ds - 1) / 2.0) * bar_w for i in range(n_ds)]
+    colours = [COLOURS[i % len(COLOURS)] for i in range(n_ds)]
 
     # ── CDFs ─────────────────────────────────────────────────────────────────
-    for ds_name, colour in zip(DATASETS, COLOURS):
+    for ds_name, colour in zip(dataset_names, colours):
         utt_arr  = stats[ds_name]["utt"]
         dial_arr = stats[ds_name]["dial"]
 
@@ -209,7 +220,7 @@ def make_figure(stats: dict, out_path: Path, token_label: str):
     ax_dial_cdf.yaxis.set_major_formatter(ticker.PercentFormatter())
 
     # ── percentile bar charts ─────────────────────────────────────────────────
-    for ds_name, colour, offset in zip(DATASETS, COLOURS, offsets):
+    for ds_name, colour, offset in zip(dataset_names, colours, offsets):
         utt_pct  = _pct_row(stats[ds_name]["utt"])
         dial_pct = _pct_row(stats[ds_name]["dial"])
 
@@ -255,7 +266,15 @@ def main():
         "--out_dir", default=None,
         help="Output directory (default: scripts/output/)",
     )
+    parser.add_argument(
+        "--datasets",
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help="Dataset names (resolve_dataset_path). Default: vhf dialseg711 doc2dial",
+    )
     args = parser.parse_args()
+    dataset_names = args.datasets if args.datasets else list(DEFAULT_DATASETS)
 
     # ── optional tokenizer ────────────────────────────────────────────────────
     tokenizer = None
@@ -268,22 +287,23 @@ def main():
 
     # ── collect stats ─────────────────────────────────────────────────────────
     stats = {}
-    for ds_name in DATASETS:
+    for ds_name in dataset_names:
         utt_arr, dial_arr = load_stats(ds_name, tokenizer)
         stats[ds_name] = {"utt": utt_arr, "dial": dial_arr}
         print(f"  {ds_name:<12s}  "
               f"utterances={len(utt_arr):,}  dialogues={len(dial_arr):,}")
 
     # ── console output ────────────────────────────────────────────────────────
-    print_table(stats)
-    print_coverage(stats)
-    print_recommendations(stats)
+    print_table(stats, dataset_names)
+    print_coverage(stats, dataset_names)
+    print_recommendations(stats, dataset_names)
 
     # ── figure ────────────────────────────────────────────────────────────────
     out_dir  = Path(args.out_dir) if args.out_dir else ROOT / "scripts" / "output"
     suffix   = "_subword" if tokenizer else "_word"
-    out_path = out_dir / f"dataset_length_stats{suffix}.png"
-    make_figure(stats, out_path, token_label)
+    ds_tag = "_".join(dataset_names) if len(dataset_names) <= 3 else f"{len(dataset_names)}ds"
+    out_path = out_dir / f"dataset_length_stats{suffix}_{ds_tag}.png"
+    make_figure(stats, out_path, token_label, dataset_names)
 
 
 if __name__ == "__main__":

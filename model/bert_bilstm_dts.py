@@ -7,6 +7,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torchcrf import CRF
 
 from model.base_model import BaseModel
+from utils.dts_data import topic_channel_sets_from_info
 """
 Dual-stream DTS model definition.
 Only model structure is provided here (no training / CLI / data pipeline).
@@ -89,7 +90,8 @@ class DualStreamSegmenter(BaseModel):
         self.head_s_start = _make_mlp_head(h2, dropout)
         self.head_w_start = _make_mlp_head(h2, dropout)
         self.merge_logit = nn.Parameter(torch.zeros(1))
-        self.kw_scale_logit = nn.Parameter(torch.zeros(1))
+        self.kw_logit_coh = nn.Parameter(torch.zeros(1))
+        self.kw_logit_bnd = nn.Parameter(torch.zeros(1))
         # Utterance Boundary Informativeness Weighting (UBIW)
         # A shared scorer over BiLSTM outputs of both streams. Maps h2-dim
         # contextual features → scalar informativeness ∈ (0,1) per utterance.
@@ -98,7 +100,12 @@ class DualStreamSegmenter(BaseModel):
         # near-neutral and must earn its effect via gradient updates; no
         # external supervision is required.
         if use_ubiw:
-            self.ubiw_scorer = nn.Sequential(
+            self.ubiw_scorer_end = nn.Sequential(
+                nn.Linear(h2, 64),
+                nn.Tanh(),
+                nn.Linear(64, 1),
+            )
+            self.ubiw_scorer_start = nn.Sequential(
                 nn.Linear(h2, 64),
                 nn.Tanh(),
                 nn.Linear(64, 1),
@@ -107,12 +114,12 @@ class DualStreamSegmenter(BaseModel):
         self.register_buffer("log_pos_weight", torch.zeros((), dtype=torch.float32))
         self.crf = CRF(num_tags=2, batch_first=True) if use_crf else None
         self.topic_keywords = {}
-        self.topic_word_set = {}
+        self.topic_kw_channels = {}
         if os.path.exists(topic_json_path):
             with open(topic_json_path, "r", encoding="utf-8") as f:
                 self.topic_keywords = json.load(f)
-            self.topic_word_set = {
-                ds: set(info.get("all_top_words", []))
+            self.topic_kw_channels = {
+                ds: topic_channel_sets_from_info(info)
                 for ds, info in self.topic_keywords.items()
             }
 
@@ -123,27 +130,49 @@ class DualStreamSegmenter(BaseModel):
         self.head_s_start.load_state_dict(self.head_s.state_dict())
         self.head_w_start.load_state_dict(self.head_w.state_dict())
 
+    def load_state_dict(self, state_dict, strict: bool = True):
+        d = dict(state_dict)
+        # backward compat: old checkpoints used kw_scale_logit / kw_scale_logit_ae
+        if "kw_logit_coh" not in d:
+            if "kw_scale_logit_ae" in d:
+                d["kw_logit_coh"] = d.pop("kw_scale_logit_ae")
+            elif "kw_scale_logit" in d:
+                d["kw_logit_coh"] = d.pop("kw_scale_logit")
+        if "kw_logit_bnd" not in d and "kw_scale_logit_bd" in d:
+            d["kw_logit_bnd"] = d.pop("kw_scale_logit_bd")
+        return super().load_state_dict(d, strict=strict)
+
     def _branch_feat(
         self,
         x: torch.Tensor,
         lengths: torch.Tensor,
         lstm: nn.LSTM,
         res: nn.Linear,
-        apply_ubiw: bool = False,
     ) -> torch.Tensor:
         packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         out, _ = lstm(packed)
         umax = x.size(1)
         out, _ = pad_packed_sequence(out, batch_first=True, total_length=umax)
         feat = out + res(x[:, :umax, :])
-        if apply_ubiw:
-            # w_i ∈ (0,1): how much utterance i marks a topic boundary vs.
-            # carries within-segment content. Learned implicitly from the
-            # boundary detection objective; no utterance-level supervision.
-            info_w = torch.sigmoid(self.ubiw_scorer(feat))     # (B, T, 1)
-            strength = torch.sigmoid(self.ubiw_strength)        # scalar ∈ (0,1)
-            feat = feat * (1.0 + strength * info_w)            # residual amplification
         return feat
+
+    def _apply_ubiw(
+        self,
+        feat: torch.Tensor,
+        lengths: torch.Tensor,
+        scorer: nn.Module,
+    ) -> torch.Tensor:
+        if not self.use_ubiw:
+            return feat
+        bsz, umax, _ = feat.shape
+        info_w = torch.sigmoid(scorer(feat))
+        time_idx = torch.arange(umax, device=feat.device).unsqueeze(0)
+        valid = (time_idx < lengths.to(feat.device).unsqueeze(1)).unsqueeze(-1).to(feat.dtype)
+        denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+        info_center = (info_w * valid).sum(dim=1, keepdim=True) / denom
+        centered_w = (info_w - info_center) * valid
+        strength = torch.sigmoid(self.ubiw_strength)
+        return feat * (1.0 + strength * centered_w)
 
     def _tokens_to_utterance_vecs(
         self,
@@ -203,8 +232,16 @@ class DualStreamSegmenter(BaseModel):
     ) -> torch.Tensor:
         if kw_scores is not None:
             kw_scores = kw_scores.to(emissions.device, dtype=emissions.dtype)
-            kw_scale = torch.sigmoid(self.kw_scale_logit)
-            e1 = emissions[:, :, 1] + kw_scale * kw_scores
+            if kw_scores.dim() == 2:
+                kw_coh = kw_scores
+                kw_bnd = torch.zeros_like(kw_coh)
+            else:
+                kw_coh = kw_scores[..., 0]
+                kw_bnd = kw_scores[..., 1]
+            s_coh = torch.sigmoid(self.kw_logit_coh)
+            s_bnd = torch.sigmoid(self.kw_logit_bnd)
+            boost = s_coh * kw_coh + s_bnd * kw_bnd
+            e1 = emissions[:, :, 1] + boost
             emissions = torch.stack([emissions[:, :, 0], e1], dim=-1)
         e1 = emissions[:, :, 1] + self.log_pos_weight
         return torch.stack([emissions[:, :, 0], e1], dim=-1)
@@ -217,14 +254,23 @@ class DualStreamSegmenter(BaseModel):
         lengths: torch.Tensor,
         kw_scores: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        f_s = self._branch_feat(x_s, lengths, self.lstm_s, self.res_s, apply_ubiw=self.use_ubiw)
+        f_s = self._branch_feat(x_s, lengths, self.lstm_s, self.res_s)
         x_w_u = self._tokens_to_utterance_vecs(x_w, tok_mask, lengths)
-        f_w = self._branch_feat(x_w_u, lengths, self.lstm_w, self.res_w, apply_ubiw=self.use_ubiw)
+        f_w = self._branch_feat(x_w_u, lengths, self.lstm_w, self.res_w)
 
-        end_s = self.head_s(f_s)
-        end_w = self.head_w(f_w)
-        start_s = self.head_s_start(f_s)
-        start_w = self.head_w_start(f_w)
+        if self.use_ubiw:
+            f_s_end = self._apply_ubiw(f_s, lengths, self.ubiw_scorer_end)
+            f_w_end = self._apply_ubiw(f_w, lengths, self.ubiw_scorer_end)
+            f_s_start = self._apply_ubiw(f_s, lengths, self.ubiw_scorer_start)
+            f_w_start = self._apply_ubiw(f_w, lengths, self.ubiw_scorer_start)
+        else:
+            f_s_end, f_w_end = f_s, f_w
+            f_s_start, f_w_start = f_s, f_w
+
+        end_s = self.head_s(f_s_end)
+        end_w = self.head_w(f_w_end)
+        start_s = self.head_s_start(f_s_start)
+        start_w = self.head_w_start(f_w_start)
 
         end_emissions = self._apply_bias_terms(self._mix_streams(end_s, end_w), kw_scores=kw_scores)
         start_emissions = self._apply_bias_terms(self._mix_streams(start_s, start_w), kw_scores=kw_scores)
@@ -247,10 +293,37 @@ class DualStreamSegmenter(BaseModel):
         )
         return cut_emissions, mask
 
+    def get_ubiw_weights_dual(
+        self,
+        x_s: torch.Tensor,
+        lengths: torch.Tensor,
+        detach: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if not self.use_ubiw:
+            return None
+
+        def _compute() -> tuple[torch.Tensor, torch.Tensor]:
+            packed = pack_padded_sequence(
+                x_s, lengths.cpu(), batch_first=True, enforce_sorted=False
+            )
+            out, _ = self.lstm_s(packed)
+            umax = x_s.size(1)
+            out, _ = pad_packed_sequence(out, batch_first=True, total_length=umax)
+            feat = out + self.res_s(x_s[:, :umax, :])
+            info_end = torch.sigmoid(self.ubiw_scorer_end(feat)).squeeze(-1)
+            info_start = torch.sigmoid(self.ubiw_scorer_start(feat)).squeeze(-1)
+            return info_end, info_start
+
+        if detach:
+            with torch.no_grad():
+                return _compute()
+        return _compute()
+
     def get_ubiw_weights(
         self,
         x_s: torch.Tensor,
         lengths: torch.Tensor,
+        detach: bool = True,
     ) -> torch.Tensor | None:
         """Return per-utterance boundary informativeness weights for post-hoc analysis.
 
@@ -266,13 +339,12 @@ class DualStreamSegmenter(BaseModel):
         """
         if not self.use_ubiw:
             return None
-        with torch.no_grad():
-            packed = pack_padded_sequence(
-                x_s, lengths.cpu(), batch_first=True, enforce_sorted=False
-            )
-            out, _ = self.lstm_s(packed)
-            umax = x_s.size(1)
-            out, _ = pad_packed_sequence(out, batch_first=True, total_length=umax)
-            feat = out + self.res_s(x_s[:, :umax, :])
-            info_w = torch.sigmoid(self.ubiw_scorer(feat))  # (B, T, 1)
-            return info_w.squeeze(-1)                        # (B, T)
+        def _compute() -> torch.Tensor:
+            dual = self.get_ubiw_weights_dual(x_s, lengths, detach=False)
+            info_end, info_start = dual
+            return 0.5 * (info_end + info_start)
+
+        if detach:
+            with torch.no_grad():
+                return _compute()
+        return _compute()

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 from collections import Counter, defaultdict
@@ -6,10 +7,13 @@ from typing import List, Dict
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from sentence_transformers import SentenceTransformer
+import umap
 
 STOPWORDS = {
     'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
@@ -77,7 +81,7 @@ def get_embeddings(sentences: List[Dict], model_name: str = 'all-MiniLM-L6-v2') 
 
 
 def perform_clustering(embeddings: np.ndarray, n_clusters: int = 8) -> KMeans:
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    kmeans = KMeans(n_clusters=n_clusters, n_init=10)
     kmeans.fit(embeddings)
     return kmeans
 
@@ -183,21 +187,86 @@ def analyze_clusters_exclusive(
     return clusters
 
 
+def compute_cluster_metrics(embeddings: np.ndarray, labels: np.ndarray) -> Dict:
+    """计算定量聚类质量指标（需要至少2个cluster）"""
+    n_labels = len(set(labels))
+    if n_labels < 2:
+        return {}
+    # 样本过多时 silhouette 很慢，采样加速
+    sample_size = min(5000, len(embeddings))
+    rng = np.random.default_rng()
+    idx = rng.choice(len(embeddings), size=sample_size, replace=False)
+    sil = silhouette_score(embeddings[idx], labels[idx])
+    db  = davies_bouldin_score(embeddings, labels)   # 越小越好
+    ch  = calinski_harabasz_score(embeddings, labels)  # 越大越好
+    return {'silhouette': sil, 'davies_bouldin': db, 'calinski_harabasz': ch}
+
+
+def _scatter_panel(ax, coords: np.ndarray, labels: np.ndarray, title: str,
+                   xlabel: str, ylabel: str):
+    sc = ax.scatter(coords[:, 0], coords[:, 1], c=labels,
+                    cmap='tab10', alpha=0.5, s=8)
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_ylabel(ylabel, fontsize=9)
+    return sc
+
+
 def visualize_clusters(embeddings: np.ndarray, labels: np.ndarray,
                        dataset_name: str, output_path: str):
+    # ── 降维 ──────────────────────────────────────────────────────────────────
+    print("    PCA...")
     pca = PCA(n_components=2)
-    embeddings_2d = pca.fit_transform(embeddings)
+    pca_2d = pca.fit_transform(embeddings)
 
-    plt.figure(figsize=(14, 10))
-    scatter = plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1],
-                          c=labels, cmap='tab10', alpha=0.5, s=10)
-    plt.colorbar(scatter, label='Cluster ID')
-    plt.title(f'K-Means Clustering — {dataset_name} (PCA Visualization)')
-    plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
-    plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
-    plt.tight_layout()
+    # t-SNE: 先用 PCA 降到 50 维加速
+    print("    t-SNE (this may take a while)...")
+    n_pca_pre = min(50, embeddings.shape[1])
+    pca_pre = PCA(n_components=n_pca_pre)
+    emb_pre = pca_pre.fit_transform(embeddings)
+    tsne = TSNE(
+        n_components=2,
+        perplexity=30,
+        learning_rate="auto",
+        init="pca",
+        n_jobs=-1,
+    )
+    tsne_2d = tsne.fit_transform(emb_pre)
+
+    print("    UMAP...")
+    reducer = umap.UMAP(n_components=2, n_jobs=-1)
+    umap_2d = reducer.fit_transform(emb_pre)
+
+    panels = [
+        (pca_2d,  f'PCA  (PC1 {pca.explained_variance_ratio_[0]:.1%} / PC2 {pca.explained_variance_ratio_[1]:.1%})', 'PC1', 'PC2'),
+        (tsne_2d, 't-SNE  (perplexity=30)', 'Dim 1', 'Dim 2'),
+        (umap_2d, 'UMAP', 'Dim 1', 'Dim 2'),
+    ]
+
+    # ── 绘图 ──────────────────────────────────────────────────────────────────
+    ncols = len(panels)
+    fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 6))
+    if ncols == 1:
+        axes = [axes]
+
+    sc = None
+    for ax, (coords, title, xl, yl) in zip(axes, panels):
+        sc = _scatter_panel(ax, coords, labels, f'{dataset_name} — {title}', xl, yl)
+
+    fig.colorbar(sc, ax=axes[-1], label='Cluster ID', shrink=0.8)
+
+    # ── 定量指标标注 ─────────────────────────────────────────────────────────
+    metrics = compute_cluster_metrics(embeddings, labels)
+    if metrics:
+        info = (f"Silhouette={metrics['silhouette']:.3f}  "
+                f"DB={metrics['davies_bouldin']:.3f}  "
+                f"CH={metrics['calinski_harabasz']:.0f}")
+        fig.suptitle(info, fontsize=10, y=0.02)
+        print(f"    Cluster quality — {info}")
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
     plt.savefig(output_path, dpi=150)
-    print(f"  Saved: {output_path}")
+    print(f"    Saved: {output_path}")
     plt.close()
 
 
@@ -229,7 +298,121 @@ def save_results(dataset_name: str, clusters: List[Dict], output_path: str):
     print(f"  Saved: {output_path}")
 
 
-def export_topic_keywords(dataset_name: str, clusters: List[Dict], output_dir: str) -> Dict:
+def build_keywords_ae(
+    sentences: List[Dict],
+    labels: np.ndarray,
+    n_clusters: int,
+    max_distinctive: int = 220,
+    max_ubiquitous: int = 90,
+    min_doc_ratio_ubiq: float = 0.12,
+) -> Dict[str, List[str]]:
+    cluster_tokens: Dict[int, Counter] = defaultdict(Counter)
+    cluster_total: Dict[int, int] = defaultdict(int)
+    word_dials: Dict[str, set] = defaultdict(set)
+    for idx, sent in enumerate(sentences):
+        cid = int(labels[idx])
+        words = tokenize(sent["text"])
+        cluster_total[cid] += len(words)
+        dial = sent["dial_id"]
+        for w in words:
+            cluster_tokens[cid][w] += 1
+            word_dials[w].add(dial)
+
+    n_docs = len({s["dial_id"] for s in sentences})
+
+    def idf(w: str) -> float:
+        return math.log((n_docs + 1.0) / (len(word_dials[w]) + 1.0)) + 1.0
+
+    word_best: Dict[str, float] = {}
+    for cid in range(n_clusters):
+        tot = cluster_total[cid]
+        if tot == 0:
+            continue
+        for w, cnt in cluster_tokens[cid].items():
+            tf = cnt / tot
+            s = tf * idf(w)
+            prev = word_best.get(w)
+            if prev is None or s > prev:
+                word_best[w] = s
+
+    ranked = sorted(word_best.items(), key=lambda x: -x[1])
+    distinctive_candidates = [w for w, _ in ranked[: max_distinctive * 2]]
+
+    cluster_presence: Dict[str, int] = defaultdict(int)
+    for cid in range(n_clusters):
+        for w in cluster_tokens[cid]:
+            cluster_presence[w] += 1
+
+    global_freq: Counter = Counter()
+    for sent in sentences:
+        global_freq.update(tokenize(sent["text"]))
+
+    half = max(2, (n_clusters + 1) // 2)
+    ubiquitous_scored: List[tuple[int, str]] = []
+    for w, nc in cluster_presence.items():
+        if nc < half:
+            continue
+        df_ratio = len(word_dials[w]) / max(n_docs, 1)
+        if df_ratio < min_doc_ratio_ubiq:
+            continue
+        ubiquitous_scored.append((global_freq[w], w))
+    ubiquitous_scored.sort(reverse=True)
+    ubiquitous_words = [w for _, w in ubiquitous_scored[:max_ubiquitous]]
+
+    ub_set = set(ubiquitous_words)
+    distinctive_final = [w for w in distinctive_candidates if w not in ub_set][:max_distinctive]
+    return {"distinctive": distinctive_final, "ubiquitous": ubiquitous_words}
+
+
+def build_keywords_bd(
+    sentences: List[Dict],
+    embeddings: np.ndarray,
+    labels: np.ndarray,
+    n_clusters: int,
+    centroids: np.ndarray,
+    frac_tail: float = 0.33,
+    max_words: int = 130,
+) -> Dict[str, List[str]]:
+    c = np.asarray(centroids, dtype=np.float64)
+    lab = np.asarray(labels, dtype=np.int64)
+    emb = np.asarray(embeddings, dtype=np.float64)
+    assign = c[lab]
+    dists = np.linalg.norm(emb - assign, axis=1)
+    boundary_idx: List[int] = []
+    proto_idx: List[int] = []
+    for cid in range(n_clusters):
+        idx_c = np.where(lab == cid)[0]
+        if idx_c.size < 4:
+            continue
+        d_c = dists[idx_c]
+        hi = float(np.quantile(d_c, 1.0 - frac_tail))
+        lo = float(np.quantile(d_c, frac_tail))
+        for j in idx_c:
+            dj = dists[j]
+            if dj >= hi:
+                boundary_idx.append(int(j))
+            elif dj <= lo:
+                proto_idx.append(int(j))
+
+    bc: Counter = Counter()
+    for i in boundary_idx:
+        bc.update(tokenize(sentences[i]["text"]))
+    pc: Counter = Counter()
+    for i in proto_idx:
+        pc.update(tokenize(sentences[i]["text"]))
+
+    boundary_words = [w for w, _ in bc.most_common(max_words)]
+    prototype_words = [w for w, _ in pc.most_common(max_words)]
+    return {"boundary": boundary_words, "prototype": prototype_words}
+
+
+def export_topic_keywords(
+    dataset_name: str,
+    clusters: List[Dict],
+    output_dir: str,
+    keywords_ae: Dict[str, List[str]] | None = None,
+    keywords_bd: Dict[str, List[str]] | None = None,
+) -> Dict:
     os.makedirs(output_dir, exist_ok=True)
     payload = {
         "dataset": dataset_name,
@@ -244,6 +427,10 @@ def export_topic_keywords(dataset_name: str, clusters: List[Dict], output_dir: s
     payload["all_top_words"] = sorted(
         {w for cluster in payload["clusters"] for w in cluster["top_words"]}
     )
+    if keywords_ae:
+        payload["keywords_ae"] = keywords_ae
+    if keywords_bd:
+        payload["keywords_bd"] = keywords_bd
     out_path = os.path.join(output_dir, f"{dataset_name}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -301,10 +488,15 @@ def analyze_dataset(name: str, data: List[Dict], model_name: str = 'all-MiniLM-L
     txt_path = os.path.join(OUTPUT_DIR, f'kmeans_{name}.txt')
     save_results(name, clusters, txt_path)
 
-    viz_path = os.path.join(OUTPUT_DIR, f'kmeans_{name}_viz.png')
+    viz_path = os.path.join(OUTPUT_DIR, f'kmeans_{name}_viz_combined.png')
+    print("  Generating combined visualization (PCA / t-SNE / UMAP)...")
     visualize_clusters(embeddings, labels, name, viz_path)
 
-    return clusters
+    keywords_ae = build_keywords_ae(sentences, labels, n_clusters)
+    keywords_bd = build_keywords_bd(
+        sentences, embeddings, labels, n_clusters, kmeans.cluster_centers_
+    )
+    return clusters, keywords_ae, keywords_bd
 
 
 def main():
@@ -314,8 +506,10 @@ def main():
 
     datasets = {
         'dialseg711': load_dataset(os.path.join(DATA_DIR, 'dialseg711.json')),
-        'doc2dial':  load_dataset(os.path.join(DATA_DIR, 'doc2dial.json')),
-        'vhf':       load_dataset(os.path.join(DATA_DIR, 'vhf.json'))
+        'doc2dial': load_dataset(os.path.join(DATA_DIR, 'doc2dial.json')),
+        'vhf': load_dataset(os.path.join(DATA_DIR, 'vhf.json')),
+        'tiage': load_dataset(os.path.join(DATA_DIR, 'tiage.json')),
+        'superseg': load_dataset(os.path.join(DATA_DIR, 'superseg.json')),
     }
 
     print("=" * 70)
@@ -326,11 +520,14 @@ def main():
     all_results = {}
     topic_export = {}
     for name, data in datasets.items():
-        all_results[name] = analyze_dataset(name, data, MODEL_NAME, N_CLUSTERS)
+        clusters_i, kw_ae, kw_bd = analyze_dataset(name, data, MODEL_NAME, N_CLUSTERS)
+        all_results[name] = clusters_i
         topic_export[name] = export_topic_keywords(
             name,
-            all_results[name],
-            output_dir="/home/sijin/maritime/dts/data/topic"
+            clusters_i,
+            output_dir="/home/sijin/maritime/dts/data/topic",
+            keywords_ae=kw_ae,
+            keywords_bd=kw_bd,
         )
 
     # 汇总对比

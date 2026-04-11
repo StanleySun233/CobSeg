@@ -12,11 +12,15 @@
 #   vhf              21       33       40        75         49        67        70       112
 #   dialseg711       15       34       42       129         26        38        42        48
 #   doc2dial         15       45       64       180         13        16        18        32
+#   tiage            13       20       22        30         16        16        18        26
+#   superseg         15       44       63       324         12        16        18        23
 #
 # Coverage of chosen limits:
 #   vhf       max_utt_tokens=48  → 99.9 %   max_utterances=128 → 100 %
 #   dialseg711 max_utt_tokens=48 → 99.8 %   max_utterances=64  → 100 %
 #   doc2dial  max_utt_tokens=64  → 99.0 %   max_utterances=32  → 100 %
+#   tiage     max_utt_tokens=32  → 100 %     max_utterances=32  → 100 %
+#   superseg  max_utt_tokens=64  → 99.1 %    max_utterances=32  → 100 %
 
 vhf:
   max_utt_tokens: 48
@@ -27,5 +31,13 @@ dialseg711:
   max_utterances: 64
 
 doc2dial:
+  max_utt_tokens: 64
+  max_utterances: 32
+
+tiage:
+  max_utt_tokens: 32
+  max_utterances: 32
+
+superseg:
   max_utt_tokens: 64
   max_utterances: 32

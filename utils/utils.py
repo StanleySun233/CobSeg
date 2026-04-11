@@ -164,6 +164,8 @@ def resolve_dataset_path(dataset_name_or_path: str) -> str:
         'vfh': './data/dataset/vhf.json',
         'dialseg711': './data/dataset/dialseg711.json',
         'doc2dial': './data/dataset/doc2dial.json',
+        'tiage': './data/dataset/tiage.json',
+        'superseg': './data/dataset/superseg.json',
     }
     key = dataset_name_or_path.lower()
     return mapping.get(key, mapping['vfh'])

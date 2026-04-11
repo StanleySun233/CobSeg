@@ -22,6 +22,7 @@ from utils.dts_data import (
     MAX_UTT_TOKENS,
     MAX_UTTERANCES,
     collate_fn,
+    topic_channel_sets_from_info,
 )
 from utils.dts_utils import (
     dialogues_used_for_stream,
@@ -62,6 +63,8 @@ class ExperimentConfig:
     start_loss_weight: float
     edge_gate_alpha: float
     edge_gate_gamma: float
+    ubiw_aux_weight: float
+    ubiw_aux_tau: float
 
 
 _DATASET_CFG_CACHE: dict = {}
@@ -106,6 +109,154 @@ def compute_pos_weight(dataset: EmbeddedDialogueDataset) -> float:
     return total_neg / total_pos
 
 
+def _build_decay_targets(
+    tags_t: torch.Tensor, lengths_t: torch.Tensor, tau: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bsz, tmax = tags_t.shape
+    target = torch.zeros((bsz, tmax), dtype=torch.float32, device=tags_t.device)
+    mask_t = torch.zeros((bsz, tmax), dtype=torch.bool, device=tags_t.device)
+    pos_idx = torch.arange(tmax, device=tags_t.device, dtype=torch.float32)
+    for bi, lv in enumerate(lengths_t.tolist()):
+        l = int(lv)
+        if l <= 0:
+            continue
+        mask_t[bi, :l] = True
+        b = torch.nonzero(tags_t[bi, :l] > 0, as_tuple=False).squeeze(-1)
+        if b.numel() == 0:
+            continue
+        d = (pos_idx[:l].unsqueeze(1) - b.float().unsqueeze(0)).abs().amin(dim=1)
+        target[bi, :l] = torch.exp(-d / max(float(tau), 1e-6))
+    return target, mask_t
+
+
+def compute_batch_loss_components(
+    model: nn.Module,
+    batch: tuple,
+    device: torch.device,
+    use_crf: bool,
+    rank_loss_weight: float,
+    rank_margin: float,
+    rank_kw_gap: float,
+    end_loss_weight: float,
+    start_loss_weight: float,
+    ubiw_aux_weight: float,
+    ubiw_aux_tau: float,
+    ubiw_detach: bool,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    x_s, x_w, tok_m, labels, lengths, kw_scores = batch
+    x_s = x_s.to(device)
+    x_w = x_w.to(device)
+    tok_m = tok_m.to(device)
+    labels = labels.to(device)
+    kw_scores = kw_scores.to(device)
+
+    if hasattr(model, "forward_heads"):
+        emissions, end_emissions, start_emissions, mask = model.forward_heads(
+            x_s, x_w, tok_m, lengths, kw_scores=kw_scores
+        )
+    else:
+        emissions, mask = model(x_s, x_w, tok_m, lengths, kw_scores=kw_scores)
+        end_emissions = None
+        start_emissions = None
+    tags = labels.long().masked_fill(~mask, 0)
+    start_tags = torch.roll(tags, shifts=1, dims=1)
+    start_tags[:, 0] = 1
+    start_tags = start_tags.masked_fill(~mask, 0)
+
+    if use_crf:
+        loss_main = -model.crf(emissions, tags, mask=mask, reduction="mean")
+    else:
+        targets = tags.masked_fill(~mask, -100)
+        loss_main = nn.functional.cross_entropy(
+            emissions.view(-1, 2),
+            targets.view(-1),
+            ignore_index=-100,
+        )
+
+    z = loss_main.new_zeros(())
+    loss_end_w = z
+    loss_start_w = z
+    loss = loss_main
+
+    if end_emissions is not None and start_emissions is not None:
+        end_targets = tags.masked_fill(~mask, -100)
+        start_targets = start_tags.masked_fill(~mask, -100)
+        loss_end = nn.functional.cross_entropy(
+            end_emissions.view(-1, 2),
+            end_targets.view(-1),
+            ignore_index=-100,
+        )
+        loss_start = nn.functional.cross_entropy(
+            start_emissions.view(-1, 2),
+            start_targets.view(-1),
+            ignore_index=-100,
+        )
+        loss_end_w = end_loss_weight * loss_end
+        loss_start_w = start_loss_weight * loss_start
+        loss = loss + loss_end_w + loss_start_w
+
+    loss_rank_w = z
+    if rank_loss_weight > 0:
+        probs = torch.softmax(emissions, dim=-1)[:, :, 1]
+        rank_terms = []
+        for i, length in enumerate(lengths.tolist()):
+            l = int(length)
+            if l <= 1:
+                continue
+            p = probs[i, :l]
+            k_slice = kw_scores[i, :l]
+            k = k_slice.sum(dim=-1) if k_slice.dim() == 2 else k_slice
+            p_diff = p.unsqueeze(1) - p.unsqueeze(0)
+            k_diff = k.unsqueeze(1) - k.unsqueeze(0)
+            valid = k_diff > rank_kw_gap
+            if valid.any():
+                rank_terms.append(torch.relu(rank_margin - p_diff[valid]).mean())
+        if rank_terms:
+            rank_loss = torch.stack(rank_terms).mean()
+            loss_rank_w = rank_loss_weight * rank_loss
+            loss = loss + loss_rank_w
+
+    loss_ubiw_w = z
+    if ubiw_aux_weight > 0 and hasattr(model, "get_ubiw_weights"):
+        if hasattr(model, "get_ubiw_weights_dual"):
+            dual = model.get_ubiw_weights_dual(x_s, lengths, detach=ubiw_detach)
+            ubiw_end_pred, ubiw_start_pred = dual
+            ubiw_end_tgt, valid_mask = _build_decay_targets(tags, lengths, tau=ubiw_aux_tau)
+            ubiw_start_tgt, _ = _build_decay_targets(start_tags, lengths, tau=ubiw_aux_tau)
+            if valid_mask.any():
+                ubiw_end_loss = nn.functional.mse_loss(
+                    ubiw_end_pred[valid_mask], ubiw_end_tgt[valid_mask]
+                )
+                ubiw_start_loss = nn.functional.mse_loss(
+                    ubiw_start_pred[valid_mask], ubiw_start_tgt[valid_mask]
+                )
+                loss_ubiw_w = ubiw_aux_weight * 0.5 * (ubiw_end_loss + ubiw_start_loss)
+                loss = loss + loss_ubiw_w
+        else:
+            ubiw_pred = model.get_ubiw_weights(x_s, lengths, detach=ubiw_detach)
+            ubiw_tgt, valid_mask = _build_decay_targets(tags, lengths, tau=ubiw_aux_tau)
+            if valid_mask.any():
+                ubiw_loss = nn.functional.mse_loss(ubiw_pred[valid_mask], ubiw_tgt[valid_mask])
+                loss_ubiw_w = ubiw_aux_weight * ubiw_loss
+                loss = loss + loss_ubiw_w
+
+    parts = {
+        "main": loss_main,
+        "end": loss_end_w,
+        "start": loss_start_w,
+        "rank": loss_rank_w,
+        "ubiw": loss_ubiw_w,
+    }
+    return loss, parts
+
+
+def _format_loss_parts(stats: dict[str, float]) -> str:
+    return (
+        f"main={stats['main']:.4f} end={stats['end']:.4f} start={stats['start']:.4f} "
+        f"rank={stats['rank']:.4f} ubiw={stats['ubiw']:.4f}"
+    )
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -118,83 +269,82 @@ def train_one_epoch(
     end_loss_weight: float = 1.0,
     start_loss_weight: float = 1.0,
     grad_clip: float = 1.0,
+    ubiw_aux_weight: float = 0.0,
+    ubiw_aux_tau: float = 2.0,
     epoch: int = 1,
     epochs: int = 1,
-) -> float:
+) -> dict[str, float]:
     model.train()
-    total_loss = 0.0
+    keys = ("loss", "main", "end", "start", "rank", "ubiw")
+    acc = {k: 0.0 for k in keys}
     pbar = tqdm(loader, desc=f"train {epoch}/{epochs}", leave=True, dynamic_ncols=True)
+
     for step, batch in enumerate(pbar, start=1):
-        x_s, x_w, tok_m, labels, lengths, kw_scores = batch
-        x_s = x_s.to(device)
-        x_w = x_w.to(device)
-        tok_m = tok_m.to(device)
-        labels = labels.to(device)
-        kw_scores = kw_scores.to(device)
-
-        if hasattr(model, "forward_heads"):
-            emissions, end_emissions, start_emissions, mask = model.forward_heads(
-                x_s, x_w, tok_m, lengths, kw_scores=kw_scores
-            )
-        else:
-            emissions, mask = model(x_s, x_w, tok_m, lengths, kw_scores=kw_scores)
-            end_emissions = None
-            start_emissions = None
-        tags = labels.long().masked_fill(~mask, 0)
-        start_tags = torch.roll(tags, shifts=1, dims=1)
-        start_tags[:, 0] = 1
-        start_tags = start_tags.masked_fill(~mask, 0)
-
-        if use_crf:
-            loss = -model.crf(emissions, tags, mask=mask, reduction="mean")
-        else:
-            targets = tags.masked_fill(~mask, -100)
-            loss = nn.functional.cross_entropy(
-                emissions.view(-1, 2),
-                targets.view(-1),
-                ignore_index=-100,
-            )
-        if end_emissions is not None and start_emissions is not None:
-            end_targets = tags.masked_fill(~mask, -100)
-            start_targets = start_tags.masked_fill(~mask, -100)
-            loss_end = nn.functional.cross_entropy(
-                end_emissions.view(-1, 2),
-                end_targets.view(-1),
-                ignore_index=-100,
-            )
-            loss_start = nn.functional.cross_entropy(
-                start_emissions.view(-1, 2),
-                start_targets.view(-1),
-                ignore_index=-100,
-            )
-            loss = loss + end_loss_weight * loss_end + start_loss_weight * loss_start
-        if rank_loss_weight > 0:
-            probs = torch.softmax(emissions, dim=-1)[:, :, 1]
-            rank_terms = []
-            for i, length in enumerate(lengths.tolist()):
-                l = int(length)
-                if l <= 1:
-                    continue
-                p = probs[i, :l]
-                k = kw_scores[i, :l]
-                p_diff = p.unsqueeze(1) - p.unsqueeze(0)
-                k_diff = k.unsqueeze(1) - k.unsqueeze(0)
-                valid = k_diff > rank_kw_gap
-                if valid.any():
-                    rank_terms.append(torch.relu(rank_margin - p_diff[valid]).mean())
-            if rank_terms:
-                rank_loss = torch.stack(rank_terms).mean()
-                loss = loss + rank_loss_weight * rank_loss
-
+        loss, parts = compute_batch_loss_components(
+            model,
+            batch,
+            device,
+            use_crf=use_crf,
+            rank_loss_weight=rank_loss_weight,
+            rank_margin=rank_margin,
+            rank_kw_gap=rank_kw_gap,
+            end_loss_weight=end_loss_weight,
+            start_loss_weight=start_loss_weight,
+            ubiw_aux_weight=ubiw_aux_weight,
+            ubiw_aux_tau=ubiw_aux_tau,
+            ubiw_detach=False,
+        )
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        total_loss += loss.item()
-        pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{total_loss / step:.4f}")
+        acc["loss"] += loss.item()
+        for name in ("main", "end", "start", "rank", "ubiw"):
+            acc[name] += parts[name].item()
+        pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{acc['loss'] / step:.4f}")
 
-    return total_loss / max(len(loader), 1)
+    nbatch = max(len(loader), 1)
+    return {k: acc[k] / nbatch for k in keys}
+
+
+def eval_loss_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    use_crf: bool,
+    rank_loss_weight: float = 0.0,
+    rank_margin: float = 0.1,
+    rank_kw_gap: float = 0.05,
+    end_loss_weight: float = 1.0,
+    start_loss_weight: float = 1.0,
+    ubiw_aux_weight: float = 0.0,
+    ubiw_aux_tau: float = 2.0,
+) -> dict[str, float]:
+    model.eval()
+    keys = ("loss", "main", "end", "start", "rank", "ubiw")
+    acc = {k: 0.0 for k in keys}
+    nbatch = max(len(loader), 1)
+    with torch.no_grad():
+        for batch in loader:
+            loss, parts = compute_batch_loss_components(
+                model,
+                batch,
+                device,
+                use_crf=use_crf,
+                rank_loss_weight=rank_loss_weight,
+                rank_margin=rank_margin,
+                rank_kw_gap=rank_kw_gap,
+                end_loss_weight=end_loss_weight,
+                start_loss_weight=start_loss_weight,
+                ubiw_aux_weight=ubiw_aux_weight,
+                ubiw_aux_tau=ubiw_aux_tau,
+                ubiw_detach=True,
+            )
+            acc["loss"] += loss.item()
+            for name in ("main", "end", "start", "rank", "ubiw"):
+                acc[name] += parts[name].item()
+    return {k: acc[k] / nbatch for k in keys}
 
 
 def predict(
@@ -279,15 +429,18 @@ def run_single(cfg: ExperimentConfig) -> None:
     print(f"Loading HF model: {cfg.encoder}")
     tokenizer = AutoTokenizer.from_pretrained(cfg.encoder, trust_remote_code=True, local_files_only=True)
     enc_model = AutoModel.from_pretrained(cfg.encoder, trust_remote_code=True, local_files_only=True).to(device).eval()
-    topic_word_set = {}
+    topic_channels_by_ds: dict[str, dict[str, set[str]]] = {}
     if os.path.exists(cfg.topic_json_path):
         with open(cfg.topic_json_path, "r", encoding="utf-8") as f:
             topic_data = json.load(f)
-        topic_word_set = {
-            ds: set(info.get("all_top_words", []))
+        topic_channels_by_ds = {
+            ds: topic_channel_sets_from_info(info)
             for ds, info in topic_data.items()
         }
         print(f"Loaded topic keywords from {cfg.topic_json_path}")
+    topic_channels = topic_channels_by_ds.get(
+        cfg.dataset, topic_channel_sets_from_info({})
+    )
 
     train_data = EmbeddedDialogueDataset(
         train_dialogues,
@@ -298,7 +451,7 @@ def run_single(cfg: ExperimentConfig) -> None:
         max_utterances=max_utterances,
         max_utt_tokens=max_utt_tokens,
         dataset_name=cfg.dataset,
-        topic_word_set=topic_word_set,
+        topic_channels=topic_channels,
     )
     test_data = EmbeddedDialogueDataset(
         test_dialogues,
@@ -309,7 +462,7 @@ def run_single(cfg: ExperimentConfig) -> None:
         max_utterances=max_utterances,
         max_utt_tokens=max_utt_tokens,
         dataset_name=cfg.dataset,
-        topic_word_set=topic_word_set,
+        topic_channels=topic_channels,
     )
 
     if not cfg.eval_only and len(train_data.samples) == 0:
@@ -348,7 +501,7 @@ def run_single(cfg: ExperimentConfig) -> None:
             max_utterances=max_utterances,
             max_utt_tokens=max_utt_tokens,
             dataset_name=cfg.dataset,
-            topic_word_set=topic_word_set,
+            topic_channels=topic_channels,
         )
         val_loader = DataLoader(
             val_data,
@@ -402,14 +555,13 @@ def run_single(cfg: ExperimentConfig) -> None:
         factor=cfg.lr_factor,
         patience=cfg.lr_patience,
         min_lr=cfg.min_lr,
-        verbose=True,
     )
 
     best_pk = float("inf")
     epochs_no_improve = 0
 
     for epoch in range(1, cfg.epochs + 1):
-        train_loss = train_one_epoch(
+        train_stats = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -420,8 +572,23 @@ def run_single(cfg: ExperimentConfig) -> None:
             rank_kw_gap=cfg.rank_kw_gap,
             end_loss_weight=cfg.end_loss_weight,
             start_loss_weight=cfg.start_loss_weight,
+            ubiw_aux_weight=cfg.ubiw_aux_weight,
+            ubiw_aux_tau=cfg.ubiw_aux_tau,
             epoch=epoch,
             epochs=cfg.epochs,
+        )
+        val_loss_stats = eval_loss_one_epoch(
+            model,
+            val_loader,
+            device,
+            use_crf=use_crf,
+            rank_loss_weight=cfg.rank_loss_weight,
+            rank_margin=cfg.rank_margin,
+            rank_kw_gap=cfg.rank_kw_gap,
+            end_loss_weight=cfg.end_loss_weight,
+            start_loss_weight=cfg.start_loss_weight,
+            ubiw_aux_weight=cfg.ubiw_aux_weight,
+            ubiw_aux_tau=cfg.ubiw_aux_tau,
         )
 
         preds_v, labels_v = predict(model, val_loader, device, use_crf=use_crf)
@@ -429,7 +596,9 @@ def run_single(cfg: ExperimentConfig) -> None:
         scheduler.step(metrics_val["PK"])
 
         print(
-            f"Epoch {epoch:3d}/{cfg.epochs}  loss={train_loss:.4f}  "
+            f"Epoch {epoch:3d}/{cfg.epochs}  "
+            f"tr_loss={train_stats['loss']:.4f} [{_format_loss_parts(train_stats)}]  "
+            f"val_loss={val_loss_stats['loss']:.4f} [{_format_loss_parts(val_loss_stats)}]  "
             f"lr={optimizer.param_groups[0]['lr']:.2e}  ",
             end="",
         )
@@ -480,7 +649,11 @@ def run_single(cfg: ExperimentConfig) -> None:
 def main():
     parser = argparse.ArgumentParser(description="DTS training entry (unified)")
     parser.add_argument("--model_name", default="bert_bilstm", choices=("bert_bilstm", "bert"))
-    parser.add_argument("--dataset", default="vhf")
+    parser.add_argument(
+        "--dataset",
+        default="vhf",
+        help="vhf | dialseg711 | doc2dial | tiage | superseg, or path to a .json dialogue file",
+    )
     parser.add_argument("--encoder", default="BAAI/bge-m3")
     parser.add_argument("--emb_batch", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=50)
@@ -507,6 +680,8 @@ def main():
     parser.add_argument("--start_loss_weight", type=float, default=1.0)
     parser.add_argument("--edge_gate_alpha", type=float, default=0.25)
     parser.add_argument("--edge_gate_gamma", type=float, default=1.5)
+    parser.add_argument("--ubiw_aux_weight", type=float, default=0.2)
+    parser.add_argument("--ubiw_aux_tau", type=float, default=2.0)
 
     args = parser.parse_args()
 
