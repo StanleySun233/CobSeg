@@ -8,12 +8,11 @@ __pycache__/
 *.nbc
 *.nbi
 
-# Model checkpoints (keep results/configs, ignore model files)
-checkpoints/**/*.pt
-checkpoints/**/*.pth
-checkpoints/**/*.ckpt
-checkpoints/**/*.bin
-checkpoints/**/*.safetensors
+# Model checkpoints
+checkpoints/
+
+# Comparison/component directories
+comp/
 
 # Virtual environment
 venv/
