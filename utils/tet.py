@@ -56,21 +56,25 @@ def similarity_computing(
     model.eval()
 
     if mode == "SC":
-        inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model(
-                input_ids=inputs["input_ids"].to(device),
-                attention_mask=inputs["attention_mask"].to(device),
-            )
-            mask = inputs["attention_mask"].unsqueeze(-1).to(device).float()
-            embeddings = torch.sum(outputs[0] * mask, dim=1) / torch.clamp(
-                mask.sum(dim=1), min=1e-9
-            )
-        scores = (
-            torch.cosine_similarity(embeddings[:-1], embeddings[1:])
-            .cpu()
-            .tolist()
-        )
+        # Encode in batches to avoid OOM on long dialogues
+        all_embeddings = []
+        for start in range(0, len(texts), batch_size):
+            batch_texts = texts[start : start + batch_size]
+            inputs = tokenizer(batch_texts, padding=True, truncation=True, return_tensors="pt")
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=inputs["input_ids"].to(device),
+                    attention_mask=inputs["attention_mask"].to(device),
+                )
+                mask = inputs["attention_mask"].unsqueeze(-1).to(device).float()
+                emb = torch.sum(outputs[0] * mask, dim=1) / torch.clamp(
+                    mask.sum(dim=1), min=1e-9
+                )
+                all_embeddings.append(emb)
+        embeddings = torch.cat(all_embeddings, dim=0)
+        # cosine similarity is in [-1, 1], rescale to [0, 1] for depth computing
+        cos_sim = torch.cosine_similarity(embeddings[:-1], embeddings[1:])
+        scores = ((cos_sim + 1.0) / 2.0).cpu().tolist()
         return scores
 
     # --- NSP mode: cross-encoder ---

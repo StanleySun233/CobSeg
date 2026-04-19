@@ -71,6 +71,7 @@ class NSPExperimentConfig:
     num_samples: int
     exp_name: str
     eval_only: bool
+    balance: bool
 
 
 # ---------------------------------------------------------------------------
@@ -100,14 +101,47 @@ class SentencePairDataset(Dataset):
         return {k: v.squeeze(0) for k, v in enc.items()}, torch.tensor(label, dtype=torch.long)
 
 
+class BiEncoderPairDataset(Dataset):
+    """Separately tokenize sent1 and sent2 for bi-encoder (SC) training."""
+
+    def __init__(self, pairs: list[tuple[str, str, int]], tokenizer, max_length: int = 128):
+        self.pairs = pairs
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int):
+        s1, s2, label = self.pairs[idx]
+        enc1 = self.tokenizer(
+            s1, padding="max_length", max_length=self.max_length,
+            truncation=True, return_tensors="pt",
+        )
+        enc2 = self.tokenizer(
+            s2, padding="max_length", max_length=self.max_length,
+            truncation=True, return_tensors="pt",
+        )
+        # CosineEmbeddingLoss expects +1 for same, -1 for different
+        cos_label = 1.0 if label == 1 else -1.0
+        return (
+            {k: v.squeeze(0) for k, v in enc1.items()},
+            {k: v.squeeze(0) for k, v in enc2.items()},
+            torch.tensor(cos_label, dtype=torch.float),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Pair construction from Utterance objects
 # ---------------------------------------------------------------------------
 
-def build_pairs(dialogues: list) -> list[tuple[str, str, int]]:
+def build_pairs(dialogues: list, balance: bool = False, seed: int = 42) -> list[tuple[str, str, int]]:
     """Construct (sent_a, sent_b, label) pairs from Utterance objects.
 
     label=1 if both utterances are in the same segment, 0 otherwise.
+
+    If balance=True, downsample the majority class (positive) to match the
+    minority class (negative) count, producing a ~1:1 ratio.
     """
     pairs: list[tuple[str, str, int]] = []
     for dial in dialogues:
@@ -122,6 +156,19 @@ def build_pairs(dialogues: list) -> list[tuple[str, str, int]]:
             else:
                 label = 1
             pairs.append((utts[i], utts[i + 1], label))
+
+    if balance:
+        import random
+        rng = random.Random(seed)
+        pos = [p for p in pairs if p[2] == 1]
+        neg = [p for p in pairs if p[2] == 0]
+        if len(pos) > len(neg) and neg:
+            pos = rng.sample(pos, len(neg))
+        elif len(neg) > len(pos) and pos:
+            neg = rng.sample(neg, len(pos))
+        pairs = pos + neg
+        rng.shuffle(pairs)
+
     return pairs
 
 
@@ -172,6 +219,17 @@ class NSPTextTilingModel(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Training helpers
+# ---------------------------------------------------------------------------
+
+def _mean_pool(model_output, attention_mask):
+    """Mean pooling over token embeddings, masked by attention_mask."""
+    token_embeddings = model_output[0]  # (B, seq_len, hidden)
+    mask = attention_mask.unsqueeze(-1).float()  # (B, seq_len, 1)
+    return torch.sum(token_embeddings * mask, dim=1) / torch.clamp(mask.sum(dim=1), min=1e-9)
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -189,28 +247,33 @@ def train_nsp(
     alpha_lower: float = -2.0,
     alpha_upper: float = 2.0,
     alpha_step: float = 0.1,
+    balance: bool = False,
 ) -> dict:
-    """Fine-tune NSP model with epoch-wise evaluation on dev/test.
+    """Fine-tune NSP or SC model with epoch-wise evaluation on dev/test.
 
     Returns:
         dict with keys: best_epoch, best_alpha, best_dev_score, history
     """
-    print("[NSP] Building training pairs...")
-    pairs = build_pairs(train_dialogues)
+    tag = model.mode
+    print(f"[{tag}] Building training pairs...")
+    pairs = build_pairs(train_dialogues, balance=balance, seed=42)
     pos = sum(1 for _, _, l in pairs if l == 1)
     neg = len(pairs) - pos
-    print(f"[NSP] Total pairs: {len(pairs)}  (pos={pos}, neg={neg})")
+    print(f"[{tag}] Total pairs: {len(pairs)}  (pos={pos}, neg={neg})")
 
     if model.mode == "NSP":
         train_model = AutoModelForSequenceClassification.from_pretrained(
             model.model_name_or_path, num_labels=2
         ).to(device)
+        dataset = SentencePairDataset(pairs, model.tokenizer, max_length=max_length)
     else:
-        train_model = model.model.to(device)
+        train_model = AutoModel.from_pretrained(model.model_name_or_path).to(device)
+        dataset = BiEncoderPairDataset(pairs, model.tokenizer, max_length=max_length)
 
-    dataset = SentencePairDataset(pairs, model.tokenizer, max_length=max_length)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     optimizer = AdamW(train_model.parameters(), lr=lr)
+
+    cos_loss_fn = nn.CosineEmbeddingLoss() if model.mode == "SC" else None
 
     # Fallback: if no dev, use test for alpha search (but still report test separately)
     search_dialogues = dev_dialogues if dev_dialogues else test_dialogues
@@ -226,14 +289,29 @@ def train_nsp(
         # --- Training ---
         train_model.train()
         total_loss = 0.0
-        for batch_enc, labels in tqdm(loader, desc=f"Epoch {epoch}/{epochs} train"):
-            batch_enc = {k: v.to(device) for k, v in batch_enc.items()}
-            labels = labels.to(device)
-            optimizer.zero_grad()
-            out = train_model(**batch_enc, labels=labels)
-            out.loss.backward()
-            optimizer.step()
-            total_loss += out.loss.item()
+
+        if model.mode == "SC":
+            for enc1, enc2, cos_labels in tqdm(loader, desc=f"Epoch {epoch}/{epochs} train"):
+                enc1 = {k: v.to(device) for k, v in enc1.items()}
+                enc2 = {k: v.to(device) for k, v in enc2.items()}
+                cos_labels = cos_labels.to(device)
+                optimizer.zero_grad()
+                emb1 = _mean_pool(train_model(**enc1), enc1["attention_mask"])
+                emb2 = _mean_pool(train_model(**enc2), enc2["attention_mask"])
+                loss = cos_loss_fn(emb1, emb2, cos_labels)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+        else:
+            for batch_enc, labels in tqdm(loader, desc=f"Epoch {epoch}/{epochs} train"):
+                batch_enc = {k: v.to(device) for k, v in batch_enc.items()}
+                labels = labels.to(device)
+                optimizer.zero_grad()
+                out = train_model(**batch_enc, labels=labels)
+                out.loss.backward()
+                optimizer.step()
+                total_loss += out.loss.item()
+
         avg_loss = total_loss / len(loader)
         print(f"[Epoch {epoch}/{epochs}] train_loss={avg_loss:.4f}")
 
@@ -426,6 +504,7 @@ def run_nsp_texttiling(cfg: NSPExperimentConfig) -> None:
             epochs=cfg.epochs, batch_size=cfg.batch_size,
             lr=cfg.lr, max_length=cfg.max_length,
             alpha_lower=cfg.alpha_lower, alpha_upper=cfg.alpha_upper, alpha_step=cfg.alpha_step,
+            balance=cfg.balance,
         )
         best_alpha = train_info["best_alpha"]
         print(f"\n[Final] Using best model from epoch {train_info['best_epoch']}, alpha={best_alpha:.2f}")
@@ -507,6 +586,8 @@ def main():
     parser.add_argument("--num_samples", type=int, default=-1)
     parser.add_argument("--exp_name", default="nsp_texttiling")
     parser.add_argument("--eval_only", action="store_true")
+    parser.add_argument("--balance", action="store_true",
+                        help="Downsample majority class to balance pos/neg training pairs")
     args = parser.parse_args()
 
     cfg = NSPExperimentConfig(**vars(args))
