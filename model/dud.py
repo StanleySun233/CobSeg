@@ -354,8 +354,3 @@ class DUD(BaseModel):
             with torch.no_grad():
                 return _compute()
         return _compute()
-
-
-# Backward-compatible alias for older scripts/checkpoints that still refer to
-# the pre-rename class symbol.
-DualStreamSegmenter = DUD

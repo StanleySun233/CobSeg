@@ -383,7 +383,7 @@ def predict(
 
 
 def build_model(cfg: ExperimentConfig, input_dim: int, max_utt_tokens: int) -> tuple[nn.Module, bool]:
-    if cfg.model_name in ("dud", "bert_bilstm"):
+    if cfg.model_name == "dud":
         model = DUD(
             input_dim=input_dim,
             max_utt_tokens=max_utt_tokens,
@@ -648,7 +648,7 @@ def run_single(cfg: ExperimentConfig) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="DTS training entry (unified)")
-    parser.add_argument("--model_name", default="dud", choices=("dud", "bert_bilstm", "bert"))
+    parser.add_argument("--model_name", default="dud", choices=("dud", "bert"))
     parser.add_argument(
         "--dataset",
         default="vhf",
