@@ -9,7 +9,13 @@ from torchcrf import CRF
 from model.base_model import BaseModel
 from utils.dts_data import topic_channel_sets_from_info
 """
-Dual-stream DTS model definition.
+DUD model definition.
+
+The acronym follows the paper naming:
+- first D: Dual
+- U: UBIW
+- second D: AE/BD dual-channel
+
 Only model structure is provided here (no training / CLI / data pipeline).
 """
 
@@ -23,7 +29,7 @@ def _make_mlp_head(hidden2: int, dropout: float) -> nn.Sequential:
     )
 
 
-class DualStreamSegmenter(BaseModel):
+class DUD(BaseModel):
     def __init__(
         self,
         input_dim: int,
@@ -348,3 +354,8 @@ class DualStreamSegmenter(BaseModel):
             with torch.no_grad():
                 return _compute()
         return _compute()
+
+
+# Backward-compatible alias for older scripts/checkpoints that still refer to
+# the pre-rename class symbol.
+DualStreamSegmenter = DUD

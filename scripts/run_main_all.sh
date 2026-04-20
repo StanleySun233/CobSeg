@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 
 DATASETS=(vhf dialseg711 doc2dial tiage superseg)
 
-MODEL_NAME="${MODEL_NAME:-bert_bilstm}"
+MODEL_NAME="${MODEL_NAME:-dud}"
 ENCODER="${ENCODER:-roberta-base}"
 EPOCHS="${EPOCHS:-50}"
 EMB_BATCH="${EMB_BATCH:-64}"
@@ -25,7 +25,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 Run the main DTS model on all five datasets and save summary metrics to CSV.
 
 Environment variables you can override:
-  MODEL_NAME=bert_bilstm
+  MODEL_NAME=dud
   ENCODER=roberta-base
   EPOCHS=50
   EMB_BATCH=64

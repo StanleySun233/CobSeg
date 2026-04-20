@@ -260,7 +260,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--no_val", action="store_true", help="Skip validation split metrics.")
-    parser.add_argument("--model_name", default="bert_bilstm", choices=("bert_bilstm", "bert"))
+    parser.add_argument("--model_name", default="dud", choices=("dud", "bert_bilstm", "bert"))
     parser.add_argument("--stream_mode", choices=("dual", "sentence", "token"), default="dual")
     parser.add_argument("--disable_token_transformer", action="store_true")
     parser.add_argument("--disable_crf", action="store_true")

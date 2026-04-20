@@ -1,4 +1,4 @@
-"""Generate academic conference PPT for DualStreamSegmenter."""
+"""Generate academic conference PPT for DUD."""
 
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
@@ -160,7 +160,7 @@ def build_title_slide(prs):
     add_textbox(slide,
                 Inches(0.55), Inches(5.9),
                 Inches(12), Inches(0.6),
-                "DualStreamSegmenter  |  UBIW  |  Coh/Bnd Keyword Injection  |  CRF",
+                "DUD  |  Dual + UBIW + AE/BD Dual-Channel  |  CRF",
                 font_size=14, color=GRAY, italic=True, align=PP_ALIGN.LEFT)
 
     return slide
@@ -192,7 +192,7 @@ def build_outline_slide(prs):
     items = [
         ("01", "研究背景与问题定义", "Background & Problem Formulation"),
         ("02", "现有方法的局限", "Limitations of Existing Methods"),
-        ("03", "DualStreamSegmenter 方法论", "Proposed Method"),
+        ("03", "DUD 方法论", "Proposed Method"),
         ("04", "实验设置与结果", "Experiments & Results"),
         ("05", "消融分析", "Ablation Study"),
         ("06", "结论与展望", "Conclusion"),
@@ -341,10 +341,10 @@ def build_limitations_slide(prs):
 
 
 def build_overview_slide(prs):
-    """DualStreamSegmenter architecture overview."""
+    """DUD architecture overview."""
     slide = blank_slide(prs)
     add_rect(slide, 0, 0, SLIDE_W, SLIDE_H, fill_color=LIGHT)
-    slide_header(slide, "方法概览  DualStreamSegmenter Overview")
+    slide_header(slide, "方法概览  DUD Overview")
 
     # three modules
     modules = [
@@ -709,7 +709,7 @@ def build_results_slide(prs):
                     align=PP_ALIGN.LEFT if j == 0 else PP_ALIGN.CENTER)
 
     add_textbox(slide, Inches(0.25), Inches(4.75), Inches(12.5), Inches(0.35),
-                "★ 粗体金色行为 DualStreamSegmenter (本文方法)，Pk/WD 越低越好，F1 越高越好。"
+                "★ 粗体金色行为 DUD (本文方法)，Pk/WD 越低越好，F1 越高越好。"
                 "  Baseline values are from respective papers or our re-runs.",
                 font_size=12, italic=True, color=GRAY)
 
@@ -942,7 +942,7 @@ def main():
     build_analysis_slide(prs)
     build_conclusion_slide(prs)
 
-    out = "/home/sijin/maritime/dts/DualStreamSegmenter_slides.pptx"
+    out = "/home/sijin/maritime/dts/DUD_slides.pptx"
     prs.save(out)
     print(f"Saved: {out}  ({len(prs.slides)} slides)")
 

@@ -1,5 +1,5 @@
 python /home/sijin/maritime/dts/inference.py \
-  --model_name bert_bilstm \
+  --model_name dud \
   --dataset tiage \
   --encoder BAAI/bge-m3 \
   --topic_json_path ./data/topic/topic_keywords.json \

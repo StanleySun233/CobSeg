@@ -45,7 +45,7 @@ from utils.dts_data import (
     MAX_UTTERANCES,
 )
 from utils.dts_utils import segments_to_boundaries
-from model.bert_bilstm_dts import DualStreamSegmenter
+from model.dud import DUD
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -518,7 +518,7 @@ def main():
     lengths = torch.tensor([n], dtype=torch.long)
 
     # ── load model ─────────────────────────────────────────────────────────────
-    model = DualStreamSegmenter(
+    model = DUD(
         input_dim=input_dim,
         max_utt_tokens=args.max_utt_tokens,
         use_ubiw=True,

@@ -14,7 +14,7 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 from model.base_model import BaseModel
-from model.bert_bilstm_dts import DualStreamSegmenter
+from model.dud import DUD
 from model.bert_dts import PureBertSegmenter
 from utils.dialogue_dataset import DialogueDataset
 from utils.dts_data import (
@@ -383,8 +383,8 @@ def predict(
 
 
 def build_model(cfg: ExperimentConfig, input_dim: int, max_utt_tokens: int) -> tuple[nn.Module, bool]:
-    if cfg.model_name == "bert_bilstm":
-        model = DualStreamSegmenter(
+    if cfg.model_name in ("dud", "bert_bilstm"):
+        model = DUD(
             input_dim=input_dim,
             max_utt_tokens=max_utt_tokens,
             stream_mode=cfg.stream_mode,
@@ -648,7 +648,7 @@ def run_single(cfg: ExperimentConfig) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="DTS training entry (unified)")
-    parser.add_argument("--model_name", default="bert_bilstm", choices=("bert_bilstm", "bert"))
+    parser.add_argument("--model_name", default="dud", choices=("dud", "bert_bilstm", "bert"))
     parser.add_argument(
         "--dataset",
         default="vhf",
@@ -694,4 +694,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
