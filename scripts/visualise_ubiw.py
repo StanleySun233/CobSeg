@@ -47,6 +47,8 @@ from utils.dts_data import (
 from utils.dts_utils import segments_to_boundaries
 from model.dud import DUD
 
+CS_ENCODER_NAME = "princeton-nlp/sup-simcse-bert-base-uncased"
+
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -110,6 +112,7 @@ def _compute_word_attributions(
     x_s: torch.Tensor,
     x_w: torch.Tensor,
     tok_mask: torch.Tensor,
+    x_t: torch.Tensor,
     lengths: torch.Tensor,
     kw_t: torch.Tensor,
     n: int,
@@ -136,8 +139,8 @@ def _compute_word_attributions(
     with torch.enable_grad():
         model.zero_grad(set_to_none=True)
         if hasattr(model, "forward_heads"):
-            cut_emissions, end_emissions, start_emissions, _ = model.forward_heads(
-                x_s, x_w_g, tok_mask, lengths, kw_scores=kw_t
+            cut_emissions, end_emissions, start_emissions, _, _ = model.forward_heads(
+                x_s, x_w_g, tok_mask, x_t, lengths, kw_scores=kw_t
             )
             if attr_target == "end":
                 target_logits = end_emissions
@@ -146,7 +149,7 @@ def _compute_word_attributions(
             else:
                 target_logits = cut_emissions
         else:
-            target_logits, _ = model(x_s, x_w_g, tok_mask, lengths, kw_scores=kw_t)
+            target_logits, _ = model(x_s, x_w_g, tok_mask, x_t, lengths, kw_scores=kw_t)
         target = target_logits[0, :n, 1].sum()
         target.backward()
 
@@ -495,15 +498,24 @@ def main():
 
     # ── keyword scores ─────────────────────────────────────────────────────────
     kw_ch = _load_topic_channels(args.topic_json_path, args.dataset)
-    kw_scores = _build_kw_channel_scores(utts, kw_ch).numpy()
+    kw_scores = _build_kw_channel_scores(utts, kw_ch)
 
     # ── encode ─────────────────────────────────────────────────────────────────
     print(f"Loading encoder: {args.encoder}")
     tokenizer = AutoTokenizer.from_pretrained(args.encoder, trust_remote_code=True, local_files_only=True)
     enc_model = AutoModel.from_pretrained(args.encoder, trust_remote_code=True, local_files_only=True).to(device).eval()
+    print(f"Loading CS encoder: {CS_ENCODER_NAME}")
+    cs_tokenizer = AutoTokenizer.from_pretrained(CS_ENCODER_NAME, trust_remote_code=True, local_files_only=True)
+    cs_enc_model = AutoModel.from_pretrained(CS_ENCODER_NAME, trust_remote_code=True, local_files_only=True).to(device).eval()
 
     sent_np, tok_np, mask_np = encode_utterances_hf(
         enc_model, tokenizer, utts, device,
+        batch_size=32,
+        max_utt_tokens=args.max_utt_tokens,
+        show_progress=True,
+    )
+    cs_sent_np, _, _ = encode_utterances_hf(
+        cs_enc_model, cs_tokenizer, utts, device,
         batch_size=32,
         max_utt_tokens=args.max_utt_tokens,
         show_progress=True,
@@ -514,7 +526,8 @@ def main():
     x_s   = torch.tensor(sent_np,   dtype=torch.float32).unsqueeze(0).to(device)
     x_w   = torch.tensor(tok_np,    dtype=torch.float32).unsqueeze(0).to(device)
     tok_m = torch.tensor(mask_np,   dtype=torch.float32).unsqueeze(0).to(device)
-    kw_t = torch.tensor(kw_scores, dtype=torch.float32).unsqueeze(0).to(device)
+    x_t = torch.tensor(cs_sent_np, dtype=torch.float32).unsqueeze(0).to(device)
+    kw_t = kw_scores.unsqueeze(0).to(device)
     lengths = torch.tensor([n], dtype=torch.long)
 
     # ── load model ─────────────────────────────────────────────────────────────
@@ -525,6 +538,14 @@ def main():
         topic_json_path=args.topic_json_path,
     ).to(device)
     load_res = model.load_state_dict(state_dict, strict=False)
+    if hasattr(model, "sync_topic_branch_from_sentence"):
+        if any(
+            k.startswith("lstm_t")
+            or k.startswith("res_t")
+            or k.startswith("head_t")
+            for k in load_res.missing_keys
+        ):
+            model.sync_topic_branch_from_sentence()
     if hasattr(model, "sync_start_heads_from_end"):
         if any(k.startswith("head_s_start") or k.startswith("head_w_start") for k in load_res.missing_keys):
             model.sync_start_heads_from_end()
@@ -535,7 +556,7 @@ def main():
 
     # ── inference (UBIW weights + boundary predictions) ───────────────────────
     with torch.no_grad():
-        emissions, mask = model(x_s, x_w, tok_m, lengths, kw_scores=kw_t)
+        emissions, mask = model(x_s, x_w, tok_m, x_t, lengths, kw_scores=kw_t)
         if hasattr(model, "get_ubiw_weights_dual"):
             ubiw_end_w, ubiw_start_w = model.get_ubiw_weights_dual(x_s, lengths)
         else:
@@ -621,7 +642,7 @@ def main():
     print("Computing token-level gradient attribution …")
     words_per_utt, word_attrs_per_utt = _compute_word_attributions(
         model, tokenizer, utts,
-        x_s, x_w, tok_m, lengths, kw_t,
+        x_s, x_w, tok_m, x_t, lengths, kw_t,
         n, args.max_utt_tokens,
         attr_target=args.attr_target,
     )

@@ -33,6 +33,8 @@ from utils.dts_utils import (
 )
 from utils.utils import resolve_dataset_path
 
+CS_ENCODER_NAME = "princeton-nlp/sup-simcse-bert-base-uncased"
+
 
 @dataclass
 class ExperimentConfig:
@@ -65,6 +67,7 @@ class ExperimentConfig:
     edge_gate_gamma: float
     ubiw_aux_weight: float
     ubiw_aux_tau: float
+    coh_aux_weight: float
 
 
 _DATASET_CFG_CACHE: dict = {}
@@ -99,7 +102,7 @@ def resolve_dataset_limits(dataset: str) -> tuple[int, int]:
 
 def compute_pos_weight(dataset: EmbeddedDialogueDataset) -> float:
     total_neg, total_pos = 0, 0
-    for _, _, _, labels, _ in dataset.samples:
+    for _, _, _, _, labels, _ in dataset.samples:
         pos = labels.sum().item()
         neg = len(labels) - pos
         total_pos += pos
@@ -141,23 +144,26 @@ def compute_batch_loss_components(
     start_loss_weight: float,
     ubiw_aux_weight: float,
     ubiw_aux_tau: float,
+    coh_aux_weight: float,
     ubiw_detach: bool,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    x_s, x_w, tok_m, labels, lengths, kw_scores = batch
+    x_s, x_w, tok_m, x_t, labels, lengths, kw_scores = batch
     x_s = x_s.to(device)
     x_w = x_w.to(device)
     tok_m = tok_m.to(device)
+    x_t = x_t.to(device)
     labels = labels.to(device)
     kw_scores = kw_scores.to(device)
 
     if hasattr(model, "forward_heads"):
-        emissions, end_emissions, start_emissions, mask = model.forward_heads(
-            x_s, x_w, tok_m, lengths, kw_scores=kw_scores
+        emissions, end_emissions, start_emissions, coh_logits, mask = model.forward_heads(
+            x_s, x_w, tok_m, x_t, lengths, kw_scores=kw_scores
         )
     else:
-        emissions, mask = model(x_s, x_w, tok_m, lengths, kw_scores=kw_scores)
+        emissions, mask = model(x_s, x_w, tok_m, x_t, lengths, kw_scores=kw_scores)
         end_emissions = None
         start_emissions = None
+        coh_logits = None
     tags = labels.long().masked_fill(~mask, 0)
     start_tags = torch.roll(tags, shifts=1, dims=1)
     start_tags[:, 0] = 1
@@ -205,7 +211,10 @@ def compute_batch_loss_components(
                 continue
             p = probs[i, :l]
             k_slice = kw_scores[i, :l]
-            k = k_slice.sum(dim=-1) if k_slice.dim() == 2 else k_slice
+            if k_slice.dim() == 2:
+                k = k_slice.sum(dim=-1)
+            else:
+                k = k_slice
             p_diff = p.unsqueeze(1) - p.unsqueeze(0)
             k_diff = k.unsqueeze(1) - k.unsqueeze(0)
             valid = k_diff > rank_kw_gap
@@ -215,6 +224,19 @@ def compute_batch_loss_components(
             rank_loss = torch.stack(rank_terms).mean()
             loss_rank_w = rank_loss_weight * rank_loss
             loss = loss + loss_rank_w
+
+    loss_coh_w = z
+    if coh_aux_weight > 0 and coh_logits is not None:
+        coh_target = (1.0 - tags.to(coh_logits.dtype))
+        pos_idx = torch.arange(coh_logits.size(1), device=coh_logits.device).unsqueeze(0)
+        next_mask = pos_idx < (lengths.to(coh_logits.device).unsqueeze(1) - 1)
+        if next_mask.any():
+            coh_loss = nn.functional.binary_cross_entropy_with_logits(
+                coh_logits[next_mask],
+                coh_target[next_mask],
+            )
+            loss_coh_w = coh_aux_weight * coh_loss
+            loss = loss + loss_coh_w
 
     loss_ubiw_w = z
     if ubiw_aux_weight > 0 and hasattr(model, "get_ubiw_weights"):
@@ -245,15 +267,16 @@ def compute_batch_loss_components(
         "end": loss_end_w,
         "start": loss_start_w,
         "rank": loss_rank_w,
+        "coh": loss_coh_w,
         "ubiw": loss_ubiw_w,
     }
     return loss, parts
 
 
-def _format_loss_parts(stats: dict[str, float]) -> str:
+def _format_metrics_brief(metrics: dict[str, float], prefix: str = "Val") -> str:
     return (
-        f"main={stats['main']:.4f} end={stats['end']:.4f} start={stats['start']:.4f} "
-        f"rank={stats['rank']:.4f} ubiw={stats['ubiw']:.4f}"
+        f"[{prefix}] PK={metrics['PK']:.4f}  WD={metrics['WD']:.4f}  "
+        f"F1={metrics['F1']:.4f}  Score={metrics['Score']:.4f}"
     )
 
 
@@ -271,11 +294,12 @@ def train_one_epoch(
     grad_clip: float = 1.0,
     ubiw_aux_weight: float = 0.0,
     ubiw_aux_tau: float = 2.0,
+    coh_aux_weight: float = 0.0,
     epoch: int = 1,
     epochs: int = 1,
 ) -> dict[str, float]:
     model.train()
-    keys = ("loss", "main", "end", "start", "rank", "ubiw")
+    keys = ("loss", "main", "end", "start", "rank", "coh", "ubiw")
     acc = {k: 0.0 for k in keys}
     pbar = tqdm(loader, desc=f"train {epoch}/{epochs}", leave=True, dynamic_ncols=True)
 
@@ -292,6 +316,7 @@ def train_one_epoch(
             start_loss_weight=start_loss_weight,
             ubiw_aux_weight=ubiw_aux_weight,
             ubiw_aux_tau=ubiw_aux_tau,
+            coh_aux_weight=coh_aux_weight,
             ubiw_detach=False,
         )
         optimizer.zero_grad()
@@ -300,7 +325,7 @@ def train_one_epoch(
         optimizer.step()
 
         acc["loss"] += loss.item()
-        for name in ("main", "end", "start", "rank", "ubiw"):
+        for name in ("main", "end", "start", "rank", "coh", "ubiw"):
             acc[name] += parts[name].item()
         pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{acc['loss'] / step:.4f}")
 
@@ -320,9 +345,10 @@ def eval_loss_one_epoch(
     start_loss_weight: float = 1.0,
     ubiw_aux_weight: float = 0.0,
     ubiw_aux_tau: float = 2.0,
+    coh_aux_weight: float = 0.0,
 ) -> dict[str, float]:
     model.eval()
-    keys = ("loss", "main", "end", "start", "rank", "ubiw")
+    keys = ("loss", "main", "end", "start", "rank", "coh", "ubiw")
     acc = {k: 0.0 for k in keys}
     nbatch = max(len(loader), 1)
     with torch.no_grad():
@@ -339,10 +365,11 @@ def eval_loss_one_epoch(
                 start_loss_weight=start_loss_weight,
                 ubiw_aux_weight=ubiw_aux_weight,
                 ubiw_aux_tau=ubiw_aux_tau,
+                coh_aux_weight=coh_aux_weight,
                 ubiw_detach=True,
             )
             acc["loss"] += loss.item()
-            for name in ("main", "end", "start", "rank", "ubiw"):
+            for name in ("main", "end", "start", "rank", "coh", "ubiw"):
                 acc[name] += parts[name].item()
     return {k: acc[k] / nbatch for k in keys}
 
@@ -358,12 +385,13 @@ def predict(
     all_labels: list[list[int]] = []
 
     with torch.no_grad():
-        for x_s, x_w, tok_m, labels, lengths, kw_scores in loader:
+        for x_s, x_w, tok_m, x_t, labels, lengths, kw_scores in loader:
             x_s = x_s.to(device)
             x_w = x_w.to(device)
             tok_m = tok_m.to(device)
+            x_t = x_t.to(device)
             kw_scores = kw_scores.to(device)
-            emissions, mask = model(x_s, x_w, tok_m, lengths, kw_scores=kw_scores)
+            emissions, mask = model(x_s, x_w, tok_m, x_t, lengths, kw_scores=kw_scores)
 
             if use_crf:
                 batch_preds = model.crf.decode(emissions, mask=mask)
@@ -404,6 +432,25 @@ def build_model(cfg: ExperimentConfig, input_dim: int, max_utt_tokens: int) -> t
     raise ValueError(f"Unsupported model_name: {cfg.model_name}")
 
 
+def _load_hf_encoder(model_name: str, device: torch.device):
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+        )
+        enc_model = AutoModel.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+        ).to(device).eval()
+        return tokenizer, enc_model
+    except OSError as exc:
+        raise RuntimeError(
+            f"Failed to load encoder '{model_name}'. "
+            "The loader uses local cache when available and otherwise tries to "
+            "download from Hugging Face."
+        ) from exc
+
+
 def run_single(cfg: ExperimentConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -426,9 +473,10 @@ def run_single(cfg: ExperimentConfig) -> None:
     test_dialogues = [d for d in full_dataset if d.set == "test"]
     print(f"Train: {len(train_dialogues)}  Valid: {len(val_dialogues)}  Test: {len(test_dialogues)}")
 
-    print(f"Loading HF model: {cfg.encoder}")
-    tokenizer = AutoTokenizer.from_pretrained(cfg.encoder, trust_remote_code=True, local_files_only=True)
-    enc_model = AutoModel.from_pretrained(cfg.encoder, trust_remote_code=True, local_files_only=True).to(device).eval()
+    print(f"Loading main encoder: {cfg.encoder}")
+    tokenizer, enc_model = _load_hf_encoder(cfg.encoder, device)
+    print(f"Loading CS encoder: {CS_ENCODER_NAME}")
+    cs_tokenizer, cs_enc_model = _load_hf_encoder(CS_ENCODER_NAME, device)
     topic_channels_by_ds: dict[str, dict[str, set[str]]] = {}
     if os.path.exists(cfg.topic_json_path):
         with open(cfg.topic_json_path, "r", encoding="utf-8") as f:
@@ -452,6 +500,8 @@ def run_single(cfg: ExperimentConfig) -> None:
         max_utt_tokens=max_utt_tokens,
         dataset_name=cfg.dataset,
         topic_channels=topic_channels,
+        cs_enc_model=cs_enc_model,
+        cs_tokenizer=cs_tokenizer,
     )
     test_data = EmbeddedDialogueDataset(
         test_dialogues,
@@ -463,6 +513,8 @@ def run_single(cfg: ExperimentConfig) -> None:
         max_utt_tokens=max_utt_tokens,
         dataset_name=cfg.dataset,
         topic_channels=topic_channels,
+        cs_enc_model=cs_enc_model,
+        cs_tokenizer=cs_tokenizer,
     )
 
     if not cfg.eval_only and len(train_data.samples) == 0:
@@ -502,6 +554,8 @@ def run_single(cfg: ExperimentConfig) -> None:
             max_utt_tokens=max_utt_tokens,
             dataset_name=cfg.dataset,
             topic_channels=topic_channels,
+            cs_enc_model=cs_enc_model,
+            cs_tokenizer=cs_tokenizer,
         )
         val_loader = DataLoader(
             val_data,
@@ -527,6 +581,14 @@ def run_single(cfg: ExperimentConfig) -> None:
     if cfg.eval_only:
         print(f"Loading checkpoint: {ckpt_path}")
         load_res = model.load_state_dict(torch.load(ckpt_path, map_location=device), strict=False)
+        if hasattr(model, "sync_topic_branch_from_sentence"):
+            if any(
+                k.startswith("lstm_t")
+                or k.startswith("res_t")
+                or k.startswith("head_t")
+                for k in load_res.missing_keys
+            ):
+                model.sync_topic_branch_from_sentence()
         if hasattr(model, "sync_start_heads_from_end"):
             if any(k.startswith("head_s_start") or k.startswith("head_w_start") for k in load_res.missing_keys):
                 model.sync_start_heads_from_end()
@@ -574,6 +636,7 @@ def run_single(cfg: ExperimentConfig) -> None:
             start_loss_weight=cfg.start_loss_weight,
             ubiw_aux_weight=cfg.ubiw_aux_weight,
             ubiw_aux_tau=cfg.ubiw_aux_tau,
+            coh_aux_weight=cfg.coh_aux_weight,
             epoch=epoch,
             epochs=cfg.epochs,
         )
@@ -589,6 +652,7 @@ def run_single(cfg: ExperimentConfig) -> None:
             start_loss_weight=cfg.start_loss_weight,
             ubiw_aux_weight=cfg.ubiw_aux_weight,
             ubiw_aux_tau=cfg.ubiw_aux_tau,
+            coh_aux_weight=cfg.coh_aux_weight,
         )
 
         preds_v, labels_v = predict(model, val_loader, device, use_crf=use_crf)
@@ -597,12 +661,11 @@ def run_single(cfg: ExperimentConfig) -> None:
 
         print(
             f"Epoch {epoch:3d}/{cfg.epochs}  "
-            f"tr_loss={train_stats['loss']:.4f} [{_format_loss_parts(train_stats)}]  "
-            f"val_loss={val_loss_stats['loss']:.4f} [{_format_loss_parts(val_loss_stats)}]  "
-            f"lr={optimizer.param_groups[0]['lr']:.2e}  ",
-            end="",
+            f"tr={train_stats['loss']:.4f}  "
+            f"val={val_loss_stats['loss']:.4f}  "
+            f"lr={optimizer.param_groups[0]['lr']:.2e}  "
+            f"{_format_metrics_brief(metrics_val, prefix='Val')}"
         )
-        print_metrics(metrics_val, prefix="Val")
 
         if metrics_val["Score"] > best_score:
             best_score = metrics_val["Score"]
@@ -621,6 +684,14 @@ def run_single(cfg: ExperimentConfig) -> None:
 
     print("\n--- Final evaluation (best checkpoint) ---")
     load_res = model.load_state_dict(torch.load(ckpt_path, map_location=device), strict=False)
+    if hasattr(model, "sync_topic_branch_from_sentence"):
+        if any(
+            k.startswith("lstm_t")
+            or k.startswith("res_t")
+            or k.startswith("head_t")
+            for k in load_res.missing_keys
+        ):
+            model.sync_topic_branch_from_sentence()
     if hasattr(model, "sync_start_heads_from_end"):
         if any(k.startswith("head_s_start") or k.startswith("head_w_start") for k in load_res.missing_keys):
             model.sync_start_heads_from_end()
@@ -682,7 +753,7 @@ def main():
     parser.add_argument("--edge_gate_gamma", type=float, default=1.5)
     parser.add_argument("--ubiw_aux_weight", type=float, default=0.2)
     parser.add_argument("--ubiw_aux_tau", type=float, default=2.0)
-
+    parser.add_argument("--coh_aux_weight", type=float, default=0.2)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)

@@ -132,6 +132,8 @@ class EmbeddedDialogueDataset(Dataset):
         enc_model: nn.Module,
         tokenizer,
         device: torch.device,
+        cs_enc_model: nn.Module | None = None,
+        cs_tokenizer=None,
         batch_size: int = 32,
         max_utterances: int = MAX_UTTERANCES,
         max_utt_tokens: int = MAX_UTT_TOKENS,
@@ -140,7 +142,16 @@ class EmbeddedDialogueDataset(Dataset):
     ):
         self.max_utterances = max_utterances
         self.max_utt_tokens = max_utt_tokens
-        self.samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self.samples: list[
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ]
+        ] = []
         channels = topic_channels or {}
 
         all_texts: list[str] = []
@@ -176,12 +187,30 @@ class EmbeddedDialogueDataset(Dataset):
             max_utt_tokens=max_utt_tokens,
             show_progress=True,
         )
+        cs_sent_np = sent_np
+        if cs_enc_model is not None and cs_tokenizer is not None:
+            print(
+                f"Encoding {len(all_texts)} utterances for CS "
+                f"(SimCSE mean-pool, L={max_utt_tokens}) …"
+            )
+            cs_sent_np, _, _ = encode_utterances_hf(
+                cs_enc_model,
+                cs_tokenizer,
+                all_texts,
+                device,
+                batch_size=batch_size,
+                max_utt_tokens=max_utt_tokens,
+                show_progress=True,
+            )
 
         for (start, n), labels, kw_scores in zip(meta, labels_list, kw_list):
-            es = torch.tensor(sent_np[start : start + n], dtype=torch.float32)
+            sent_slice = sent_np[start : start + n]
+            cs_sent_slice = cs_sent_np[start : start + n]
+            es = torch.tensor(sent_slice, dtype=torch.float32)
             ew = torch.tensor(tok_np[start : start + n], dtype=torch.float32)
             tm = torch.tensor(mask_np[start : start + n], dtype=torch.float32)
-            self.samples.append((es, ew, tm, labels, kw_scores))
+            et = torch.tensor(cs_sent_slice, dtype=torch.float32)
+            self.samples.append((es, ew, tm, et, labels, kw_scores))
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -191,7 +220,7 @@ class EmbeddedDialogueDataset(Dataset):
 
 
 def collate_fn(batch, max_utterances: int = MAX_UTTERANCES):
-    emb_s, emb_w, tok_m, labels, kw_scores = zip(*batch)
+    emb_s, emb_w, tok_m, emb_t, labels, kw_scores = zip(*batch)
     lengths = torch.tensor([s.shape[0] for s in emb_s], dtype=torch.long)
     bsz = len(batch)
     d = emb_s[0].shape[1]
@@ -199,17 +228,19 @@ def collate_fn(batch, max_utterances: int = MAX_UTTERANCES):
     pad_s = torch.zeros(bsz, max_utterances, d, dtype=torch.float32)
     pad_w = torch.zeros(bsz, max_utterances, lt, d, dtype=torch.float32)
     pad_m = torch.zeros(bsz, max_utterances, lt, dtype=torch.float32)
+    pad_t = torch.zeros(bsz, max_utterances, d, dtype=torch.float32)
     pad_y = torch.full((bsz, max_utterances), -1.0)
-    pad_kw = torch.zeros(bsz, max_utterances, 2, dtype=torch.float32)
-    for i, (s, w, m, y, kw) in enumerate(zip(emb_s, emb_w, tok_m, labels, kw_scores)):
+    kw_dim = kw_scores[0].shape[-1] if kw_scores[0].dim() > 1 else 1
+    pad_kw = torch.zeros(bsz, max_utterances, kw_dim, dtype=torch.float32)
+    for i, (s, w, m, t_emb, y, kw) in enumerate(zip(emb_s, emb_w, tok_m, emb_t, labels, kw_scores)):
         t = int(lengths[i].item())
         pad_s[i, :t] = s
         pad_w[i, :t] = w
         pad_m[i, :t] = m
+        pad_t[i, :t] = t_emb
         pad_y[i, :t] = y
         if kw.dim() == 1:
             pad_kw[i, :t, 0] = kw
         else:
             pad_kw[i, :t, :] = kw
-    return pad_s, pad_w, pad_m, pad_y, lengths, pad_kw
-
+    return pad_s, pad_w, pad_m, pad_t, pad_y, lengths, pad_kw

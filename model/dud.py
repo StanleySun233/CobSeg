@@ -89,13 +89,24 @@ class DUD(BaseModel):
         self.word_utt_proj = nn.Linear(token_hidden * 2, input_dim)
         self.lstm_s = nn.LSTM(input_size=input_dim, **lstm_kw)
         self.lstm_w = nn.LSTM(input_size=input_dim, **lstm_kw)
+        self.lstm_t = nn.LSTM(input_size=input_dim, **lstm_kw)
         self.res_s = nn.Linear(input_dim, h2)
         self.res_w = nn.Linear(input_dim, h2)
+        self.res_t = nn.Linear(input_dim, h2)
         self.head_s = _make_mlp_head(h2, dropout)
         self.head_w = _make_mlp_head(h2, dropout)
+        self.head_t = _make_mlp_head(h2, dropout)
         self.head_s_start = _make_mlp_head(h2, dropout)
         self.head_w_start = _make_mlp_head(h2, dropout)
+        self.head_t_start = _make_mlp_head(h2, dropout)
+        self.coh_head = nn.Sequential(
+            nn.Linear(h2, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 1),
+        )
         self.merge_logit = nn.Parameter(torch.zeros(1))
+        self.topic_merge_logit = nn.Parameter(torch.tensor(-1.5))
         self.kw_logit_coh = nn.Parameter(torch.zeros(1))
         self.kw_logit_bnd = nn.Parameter(torch.zeros(1))
         # Utterance Boundary Informativeness Weighting (UBIW)
@@ -135,6 +146,13 @@ class DUD(BaseModel):
     def sync_start_heads_from_end(self) -> None:
         self.head_s_start.load_state_dict(self.head_s.state_dict())
         self.head_w_start.load_state_dict(self.head_w.state_dict())
+        self.head_t_start.load_state_dict(self.head_t.state_dict())
+
+    def sync_topic_branch_from_sentence(self) -> None:
+        self.lstm_t.load_state_dict(self.lstm_s.state_dict())
+        self.res_t.load_state_dict(self.res_s.state_dict())
+        self.head_t.load_state_dict(self.head_s.state_dict())
+        self.head_t_start.load_state_dict(self.head_s_start.state_dict())
 
     def load_state_dict(self, state_dict, strict: bool = True):
         d = dict(state_dict)
@@ -231,6 +249,14 @@ class DUD(BaseModel):
         w = torch.sigmoid(self.merge_logit)
         return w * e_s + (1.0 - w) * e_w
 
+    def _mix_topic_stream(
+        self,
+        main_feat: torch.Tensor,
+        topic_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        gate = torch.sigmoid(self.topic_merge_logit)
+        return (1.0 - gate) * main_feat + gate * topic_feat
+
     def _apply_bias_terms(
         self,
         emissions: torch.Tensor,
@@ -243,7 +269,7 @@ class DUD(BaseModel):
                 kw_bnd = torch.zeros_like(kw_coh)
             else:
                 kw_coh = kw_scores[..., 0]
-                kw_bnd = kw_scores[..., 1]
+                kw_bnd = kw_scores[..., 1] if kw_scores.size(-1) > 1 else torch.zeros_like(kw_coh)
             s_coh = torch.sigmoid(self.kw_logit_coh)
             s_bnd = torch.sigmoid(self.kw_logit_bnd)
             boost = s_coh * kw_coh + s_bnd * kw_bnd
@@ -257,45 +283,62 @@ class DUD(BaseModel):
         x_s: torch.Tensor,
         x_w: torch.Tensor,
         tok_mask: torch.Tensor,
+        x_t: torch.Tensor,
         lengths: torch.Tensor,
         kw_scores: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         f_s = self._branch_feat(x_s, lengths, self.lstm_s, self.res_s)
         x_w_u = self._tokens_to_utterance_vecs(x_w, tok_mask, lengths)
         f_w = self._branch_feat(x_w_u, lengths, self.lstm_w, self.res_w)
+        f_t = self._branch_feat(x_t, lengths, self.lstm_t, self.res_t)
+        coh_logits = self.coh_head(f_t).squeeze(-1)
 
         if self.use_ubiw:
             f_s_end = self._apply_ubiw(f_s, lengths, self.ubiw_scorer_end)
             f_w_end = self._apply_ubiw(f_w, lengths, self.ubiw_scorer_end)
+            f_t_end = self._apply_ubiw(f_t, lengths, self.ubiw_scorer_end)
             f_s_start = self._apply_ubiw(f_s, lengths, self.ubiw_scorer_start)
             f_w_start = self._apply_ubiw(f_w, lengths, self.ubiw_scorer_start)
+            f_t_start = self._apply_ubiw(f_t, lengths, self.ubiw_scorer_start)
         else:
             f_s_end, f_w_end = f_s, f_w
             f_s_start, f_w_start = f_s, f_w
+            f_t_end, f_t_start = f_t, f_t
 
         end_s = self.head_s(f_s_end)
         end_w = self.head_w(f_w_end)
+        end_t = self.head_t(f_t_end)
         start_s = self.head_s_start(f_s_start)
         start_w = self.head_w_start(f_w_start)
+        start_t = self.head_t_start(f_t_start)
 
-        end_emissions = self._apply_bias_terms(self._mix_streams(end_s, end_w), kw_scores=kw_scores)
-        start_emissions = self._apply_bias_terms(self._mix_streams(start_s, start_w), kw_scores=kw_scores)
+        end_main = self._mix_streams(end_s, end_w)
+        start_main = self._mix_streams(start_s, start_w)
+        end_emissions = self._apply_bias_terms(
+            self._mix_topic_stream(end_main, end_t),
+            kw_scores=kw_scores,
+        )
+        start_emissions = self._apply_bias_terms(
+            self._mix_topic_stream(start_main, start_t),
+            kw_scores=kw_scores,
+        )
         cut_emissions = 0.5 * end_emissions + 0.5 * torch.roll(start_emissions, shifts=-1, dims=1)
         lengths = lengths.to(x_s.device)
         time_idx = torch.arange(cut_emissions.size(1), device=x_s.device).unsqueeze(0)
         mask = time_idx < lengths.unsqueeze(1)
-        return cut_emissions, end_emissions, start_emissions, mask
+        return cut_emissions, end_emissions, start_emissions, coh_logits, mask
 
     def forward(
         self,
         x_s: torch.Tensor,
         x_w: torch.Tensor,
         tok_mask: torch.Tensor,
+        x_t: torch.Tensor,
         lengths: torch.Tensor,
         kw_scores: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cut_emissions, _, _, mask = self.forward_heads(
-            x_s, x_w, tok_mask, lengths, kw_scores=kw_scores
+        cut_emissions, _, _, _, mask = self.forward_heads(
+            x_s, x_w, tok_mask, x_t, lengths, kw_scores=kw_scores
         )
         return cut_emissions, mask
 
