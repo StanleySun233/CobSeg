@@ -29,6 +29,26 @@ def _make_mlp_head(hidden2: int, dropout: float) -> nn.Sequential:
     )
 
 
+def _make_repr_adapter(input_dim: int, dropout: float) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(input_dim * 4, input_dim),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(input_dim, input_dim),
+        nn.LayerNorm(input_dim),
+    )
+
+
+def _make_feature_proj(input_dim: int, dropout: float) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(input_dim, input_dim),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(input_dim, input_dim),
+        nn.LayerNorm(input_dim),
+    )
+
+
 class DUD(BaseModel):
     def __init__(
         self,
@@ -87,6 +107,21 @@ class DUD(BaseModel):
             bidirectional=True,
         )
         self.word_utt_proj = nn.Linear(token_hidden * 2, input_dim)
+        self.repr_s_adapter = _make_repr_adapter(input_dim, dropout)
+        self.repr_w_adapter = _make_repr_adapter(input_dim, dropout)
+        self.repr_t_adapter = _make_repr_adapter(input_dim, dropout)
+        self.repr_s_gate = nn.Parameter(torch.tensor(-1.5))
+        self.repr_w_gate = nn.Parameter(torch.tensor(-1.5))
+        self.repr_t_gate = nn.Parameter(torch.tensor(-1.5))
+        self.repr_head_s = _make_mlp_head(input_dim, dropout)
+        self.repr_head_w = _make_mlp_head(input_dim, dropout)
+        self.repr_head_t = _make_mlp_head(input_dim, dropout)
+        self.nsp_head = _make_mlp_head(input_dim, dropout)
+        self.nsp_proj = _make_feature_proj(input_dim, dropout)
+        self.nsp_gate_s = nn.Parameter(torch.tensor(-1.5))
+        self.nsp_gate_w = nn.Parameter(torch.tensor(-1.5))
+        self.nsp_gate_t = nn.Parameter(torch.tensor(-2.0))
+        self.nsp_prob_logit = nn.Parameter(torch.tensor(-1.5))
         self.lstm_s = nn.LSTM(input_size=input_dim, **lstm_kw)
         self.lstm_w = nn.LSTM(input_size=input_dim, **lstm_kw)
         self.lstm_t = nn.LSTM(input_size=input_dim, **lstm_kw)
@@ -198,6 +233,16 @@ class DUD(BaseModel):
         strength = torch.sigmoid(self.ubiw_strength)
         return feat * (1.0 + strength * centered_w)
 
+    @staticmethod
+    def _valid_mask(
+        lengths: torch.Tensor,
+        umax: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        time_idx = torch.arange(umax, device=device).unsqueeze(0)
+        return (time_idx < lengths.to(device).unsqueeze(1)).unsqueeze(-1).to(dtype)
+
     def _tokens_to_utterance_vecs(
         self,
         x_w: torch.Tensor,
@@ -241,6 +286,87 @@ class DUD(BaseModel):
         u_flat = self.word_utt_proj(pooled)
         return u_flat.view(B, umax, d)
 
+    def _transition_pair_features(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz, umax, dim = x.shape
+        next_x = torch.zeros_like(x)
+        if umax > 1:
+            next_x[:, :-1, :] = x[:, 1:, :]
+        next_x[:, -1, :] = x[:, -1, :]
+        valid = self._valid_mask(lengths, umax, x.device, x.dtype)
+        last_idx = (lengths.to(x.device).clamp(min=1) - 1).unsqueeze(1)
+        time_idx = torch.arange(umax, device=x.device).unsqueeze(0)
+        last_mask = (time_idx == last_idx).unsqueeze(-1)
+        next_x = torch.where(last_mask, x, next_x)
+        x_valid = x * valid
+        next_valid = next_x * valid
+        return torch.cat(
+            [
+                x_valid,
+                next_valid,
+                torch.abs(next_valid - x_valid),
+                x_valid * next_valid,
+            ],
+            dim=-1,
+        )
+
+    def _build_transition_repr(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor,
+        adapter: nn.Module,
+        gate_logit: torch.Tensor,
+    ) -> torch.Tensor:
+        pair_feat = self._transition_pair_features(x, lengths)
+        adapted = adapter(pair_feat)
+        gate = torch.sigmoid(gate_logit)
+        valid = self._valid_mask(lengths, x.size(1), x.device, x.dtype)
+        return ((1.0 - gate) * x + gate * adapted) * valid
+
+    def classify_nsp_pairs(
+        self,
+        pair_repr: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits = self.nsp_head(pair_repr)
+        probs = torch.softmax(logits, dim=-1)[..., 1]
+        proj = self.nsp_proj(pair_repr)
+        return logits, proj, probs
+
+    def _fuse_nsp_repr(
+        self,
+        base: torch.Tensor,
+        nsp_repr: torch.Tensor | None,
+        gate_logit: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        if nsp_repr is None:
+            return base * valid
+        nsp_repr = nsp_repr.to(base.device, dtype=base.dtype)
+        gate = torch.sigmoid(gate_logit)
+        return (base + gate * nsp_repr) * valid
+
+    def build_input_representations(
+        self,
+        x_s: torch.Tensor,
+        x_w: torch.Tensor,
+        tok_mask: torch.Tensor,
+        x_t: torch.Tensor,
+        lengths: torch.Tensor,
+        nsp_repr: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x_w_u = self._tokens_to_utterance_vecs(x_w, tok_mask, lengths)
+        r_s = self._build_transition_repr(x_s, lengths, self.repr_s_adapter, self.repr_s_gate)
+        r_w = self._build_transition_repr(x_w_u, lengths, self.repr_w_adapter, self.repr_w_gate)
+        r_t = self._build_transition_repr(x_t, lengths, self.repr_t_adapter, self.repr_t_gate)
+        valid = self._valid_mask(lengths, x_s.size(1), x_s.device, x_s.dtype)
+        r_s = self._fuse_nsp_repr(r_s, nsp_repr, self.nsp_gate_s, valid)
+        r_w = self._fuse_nsp_repr(r_w, nsp_repr, self.nsp_gate_w, valid)
+        r_t = self._fuse_nsp_repr(r_t, nsp_repr, self.nsp_gate_t, valid)
+        return r_s, r_w, r_t
+
     def _mix_streams(self, e_s: torch.Tensor, e_w: torch.Tensor) -> torch.Tensor:
         if self.stream_mode == "sentence":
             return e_s
@@ -261,6 +387,7 @@ class DUD(BaseModel):
         self,
         emissions: torch.Tensor,
         kw_scores: torch.Tensor | None = None,
+        nsp_probs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if kw_scores is not None:
             kw_scores = kw_scores.to(emissions.device, dtype=emissions.dtype)
@@ -275,8 +402,56 @@ class DUD(BaseModel):
             boost = s_coh * kw_coh + s_bnd * kw_bnd
             e1 = emissions[:, :, 1] + boost
             emissions = torch.stack([emissions[:, :, 0], e1], dim=-1)
+        if nsp_probs is not None:
+            nsp_probs = nsp_probs.to(emissions.device, dtype=emissions.dtype).clamp(1e-5, 1.0 - 1e-5)
+            bias_scale = torch.sigmoid(self.nsp_prob_logit)
+            nsp_bias = bias_scale * torch.log(nsp_probs / (1.0 - nsp_probs))
+            e1 = emissions[:, :, 1] + nsp_bias
+            emissions = torch.stack([emissions[:, :, 0], e1], dim=-1)
         e1 = emissions[:, :, 1] + self.log_pos_weight
         return torch.stack([emissions[:, :, 0], e1], dim=-1)
+
+    def forward_representation_heads(
+        self,
+        x_s: torch.Tensor,
+        x_w: torch.Tensor,
+        tok_mask: torch.Tensor,
+        x_t: torch.Tensor,
+        lengths: torch.Tensor,
+        kw_scores: torch.Tensor | None = None,
+        nsp_repr: torch.Tensor | None = None,
+        nsp_probs: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        r_s, r_w, r_t = self.build_input_representations(
+            x_s,
+            x_w,
+            tok_mask,
+            x_t,
+            lengths,
+            nsp_repr=nsp_repr,
+        )
+        rep_s = self.repr_head_s(r_s)
+        rep_w = self.repr_head_w(r_w)
+        rep_t = self.repr_head_t(r_t)
+        rep_main = self._mix_streams(rep_s, rep_w)
+        rep_emissions = self._apply_bias_terms(
+            self._mix_topic_stream(rep_main, rep_t),
+            kw_scores=kw_scores,
+            nsp_probs=nsp_probs,
+        )
+        lengths = lengths.to(x_s.device)
+        time_idx = torch.arange(rep_emissions.size(1), device=x_s.device).unsqueeze(0)
+        mask = time_idx < lengths.unsqueeze(1)
+        return rep_emissions, rep_s, rep_w, rep_t, mask, r_s, r_w, r_t
 
     def forward_heads(
         self,
@@ -286,11 +461,20 @@ class DUD(BaseModel):
         x_t: torch.Tensor,
         lengths: torch.Tensor,
         kw_scores: torch.Tensor | None = None,
+        nsp_repr: torch.Tensor | None = None,
+        nsp_probs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        f_s = self._branch_feat(x_s, lengths, self.lstm_s, self.res_s)
-        x_w_u = self._tokens_to_utterance_vecs(x_w, tok_mask, lengths)
-        f_w = self._branch_feat(x_w_u, lengths, self.lstm_w, self.res_w)
-        f_t = self._branch_feat(x_t, lengths, self.lstm_t, self.res_t)
+        r_s, r_w, r_t = self.build_input_representations(
+            x_s,
+            x_w,
+            tok_mask,
+            x_t,
+            lengths,
+            nsp_repr=nsp_repr,
+        )
+        f_s = self._branch_feat(r_s, lengths, self.lstm_s, self.res_s)
+        f_w = self._branch_feat(r_w, lengths, self.lstm_w, self.res_w)
+        f_t = self._branch_feat(r_t, lengths, self.lstm_t, self.res_t)
         coh_logits = self.coh_head(f_t).squeeze(-1)
 
         if self.use_ubiw:
@@ -317,6 +501,7 @@ class DUD(BaseModel):
         end_emissions = self._apply_bias_terms(
             self._mix_topic_stream(end_main, end_t),
             kw_scores=kw_scores,
+            nsp_probs=nsp_probs,
         )
         start_emissions = self._apply_bias_terms(
             self._mix_topic_stream(start_main, start_t),
@@ -336,9 +521,18 @@ class DUD(BaseModel):
         x_t: torch.Tensor,
         lengths: torch.Tensor,
         kw_scores: torch.Tensor | None = None,
+        nsp_repr: torch.Tensor | None = None,
+        nsp_probs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cut_emissions, _, _, _, mask = self.forward_heads(
-            x_s, x_w, tok_mask, x_t, lengths, kw_scores=kw_scores
+            x_s,
+            x_w,
+            tok_mask,
+            x_t,
+            lengths,
+            kw_scores=kw_scores,
+            nsp_repr=nsp_repr,
+            nsp_probs=nsp_probs,
         )
         return cut_emissions, mask
 

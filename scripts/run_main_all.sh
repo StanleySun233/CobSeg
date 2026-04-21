@@ -17,6 +17,20 @@ TOPIC_JSON_PATH="${TOPIC_JSON_PATH:-./data/topic/topic_keywords.json}"
 RANK_LOSS_WEIGHT="${RANK_LOSS_WEIGHT:-0.1}"
 RANK_MARGIN="${RANK_MARGIN:-0.1}"
 RANK_KW_GAP="${RANK_KW_GAP:-0.05}"
+FINETUNE_MAIN_ENCODER="${FINETUNE_MAIN_ENCODER:-0}"
+MAIN_ENCODER_LR="${MAIN_ENCODER_LR:-2e-5}"
+TWO_STAGE_TRAINING="${TWO_STAGE_TRAINING:-0}"
+STAGE1_EPOCHS="${STAGE1_EPOCHS:-5}"
+STAGE1_LR="${STAGE1_LR:-5e-4}"
+STAGE1_MAIN_ENCODER_LR="${STAGE1_MAIN_ENCODER_LR:-2e-5}"
+STAGE1_AUX_WEIGHT="${STAGE1_AUX_WEIGHT:-0.5}"
+FINETUNE_TOPIC_ENCODER="${FINETUNE_TOPIC_ENCODER:-0}"
+TOPIC_ENCODER_LR="${TOPIC_ENCODER_LR:-2e-5}"
+STAGE1_FINETUNE_TOPIC_ENCODER="${STAGE1_FINETUNE_TOPIC_ENCODER:-0}"
+STAGE1_TOPIC_ENCODER_LR="${STAGE1_TOPIC_ENCODER_LR:-2e-5}"
+USE_NSP_CROSS_ENCODER="${USE_NSP_CROSS_ENCODER:-0}"
+NSP_MAX_PAIR_TOKENS="${NSP_MAX_PAIR_TOKENS:-0}"
+NSP_STAGE2_AUX_WEIGHT="${NSP_STAGE2_AUX_WEIGHT:-0.2}"
 EXP_NAME="${EXP_NAME:-main_exp}"
 OUT_CSV="${OUT_CSV:-main_exp.csv}"
 
@@ -35,18 +49,69 @@ Environment variables you can override:
   RANK_LOSS_WEIGHT=0.1
   RANK_MARGIN=0.1
   RANK_KW_GAP=0.05
+  FINETUNE_MAIN_ENCODER=0
+  MAIN_ENCODER_LR=2e-5
+  TWO_STAGE_TRAINING=0
+  STAGE1_EPOCHS=5
+  STAGE1_LR=5e-4
+  STAGE1_MAIN_ENCODER_LR=2e-5
+  STAGE1_AUX_WEIGHT=0.5
+  FINETUNE_TOPIC_ENCODER=0
+  TOPIC_ENCODER_LR=2e-5
+  STAGE1_FINETUNE_TOPIC_ENCODER=0
+  STAGE1_TOPIC_ENCODER_LR=2e-5
+  USE_NSP_CROSS_ENCODER=0
+  NSP_MAX_PAIR_TOKENS=0
+  NSP_STAGE2_AUX_WEIGHT=0.2
   EXP_NAME=main_exp
   OUT_CSV=main_exp.csv
 
 Example:
   bash scripts/run_main_all.sh
   EXP_NAME=main_exp_v2 EPOCHS=30 bash scripts/run_main_all.sh
+  FINETUNE_MAIN_ENCODER=1 MAIN_ENCODER_LR=2e-5 bash scripts/run_main_all.sh
+  FINETUNE_MAIN_ENCODER=1 TWO_STAGE_TRAINING=1 STAGE1_EPOCHS=5 bash scripts/run_main_all.sh
+  FINETUNE_MAIN_ENCODER=1 TWO_STAGE_TRAINING=1 USE_NSP_CROSS_ENCODER=1 bash scripts/run_main_all.sh
+  FINETUNE_MAIN_ENCODER=1 TWO_STAGE_TRAINING=1 USE_NSP_CROSS_ENCODER=1 STAGE1_FINETUNE_TOPIC_ENCODER=1 bash scripts/run_main_all.sh
 EOF
   exit 0
 fi
 
 echo "Running main model on datasets: ${DATASETS[*]}"
 echo "model=$MODEL_NAME encoder=$ENCODER epochs=$EPOCHS exp_name=$EXP_NAME"
+echo "finetune_main_encoder=$FINETUNE_MAIN_ENCODER main_encoder_lr=$MAIN_ENCODER_LR"
+echo "two_stage_training=$TWO_STAGE_TRAINING stage1_epochs=$STAGE1_EPOCHS stage1_lr=$STAGE1_LR"
+echo "finetune_topic_encoder=$FINETUNE_TOPIC_ENCODER stage1_finetune_topic_encoder=$STAGE1_FINETUNE_TOPIC_ENCODER"
+echo "use_nsp_cross_encoder=$USE_NSP_CROSS_ENCODER nsp_stage2_aux_weight=$NSP_STAGE2_AUX_WEIGHT"
+
+EXTRA_ARGS=()
+if [[ "$FINETUNE_MAIN_ENCODER" == "1" ]]; then
+  EXTRA_ARGS+=(--finetune_main_encoder --main_encoder_lr "$MAIN_ENCODER_LR")
+fi
+if [[ "$TWO_STAGE_TRAINING" == "1" ]]; then
+  EXTRA_ARGS+=(
+    --two_stage_training
+    --stage1_epochs "$STAGE1_EPOCHS"
+    --stage1_lr "$STAGE1_LR"
+    --stage1_main_encoder_lr "$STAGE1_MAIN_ENCODER_LR"
+    --stage1_aux_weight "$STAGE1_AUX_WEIGHT"
+  )
+fi
+if [[ "$FINETUNE_TOPIC_ENCODER" == "1" ]]; then
+  EXTRA_ARGS+=(--finetune_topic_encoder --topic_encoder_lr "$TOPIC_ENCODER_LR")
+fi
+if [[ "$STAGE1_FINETUNE_TOPIC_ENCODER" == "1" ]]; then
+  EXTRA_ARGS+=(
+    --stage1_finetune_topic_encoder
+    --stage1_topic_encoder_lr "$STAGE1_TOPIC_ENCODER_LR"
+  )
+fi
+if [[ "$USE_NSP_CROSS_ENCODER" == "1" ]]; then
+  EXTRA_ARGS+=(--use_nsp_cross_encoder --nsp_stage2_aux_weight "$NSP_STAGE2_AUX_WEIGHT")
+  if [[ "$NSP_MAX_PAIR_TOKENS" != "0" ]]; then
+    EXTRA_ARGS+=(--nsp_max_pair_tokens "$NSP_MAX_PAIR_TOKENS")
+  fi
+fi
 
 failures=0
 
@@ -65,6 +130,7 @@ for dataset in "${DATASETS[@]}"; do
     --rank_loss_weight "$RANK_LOSS_WEIGHT" \
     --rank_margin "$RANK_MARGIN" \
     --rank_kw_gap "$RANK_KW_GAP" \
+    "${EXTRA_ARGS[@]}" \
     --exp_name "$EXP_NAME"; then
     echo "===== [$dataset] main model failed ====="
     failures=$((failures + 1))
