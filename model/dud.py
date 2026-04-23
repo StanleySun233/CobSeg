@@ -249,6 +249,17 @@ class DUD(BaseModel):
         tok_mask: torch.Tensor,
         utt_lengths: torch.Tensor,
     ) -> torch.Tensor:
+        _, u_flat = self.encode_token_sequence(x_w, tok_mask, utt_lengths)
+        B, umax = x_w.shape[:2]
+        d = x_w.size(-1)
+        return u_flat.view(B, umax, d)
+
+    def encode_token_sequence(
+        self,
+        x_w: torch.Tensor,
+        tok_mask: torch.Tensor,
+        utt_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         B, umax, L, d = x_w.shape
         flat_x = x_w.view(B * umax, L, d)
         flat_m = tok_mask.view(B * umax, L)
@@ -284,7 +295,8 @@ class DUD(BaseModel):
         denom = weighted_mask.sum(dim=1).clamp(min=1e-6)
         pooled = (tok_out * weighted_mask).sum(dim=1) / denom * has_tok.unsqueeze(-1).float()
         u_flat = self.word_utt_proj(pooled)
-        return u_flat.view(B, umax, d)
+        tok_seq = tok_out.view(B, umax, L, tok_out.size(-1))
+        return tok_seq, u_flat
 
     def _transition_pair_features(
         self,

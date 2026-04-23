@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.codex/
 
 # Numba cache
 *.nbc
@@ -41,3 +42,15 @@ logs/
 # Temporary files
 *.tmp
 *.bak
+*.backup
+
+# Generated analysis artifacts
+scripts/output/
+
+# Data: keep only source datasets/topics/config
+data/*
+!data/dataset/
+!data/dataset/**
+!data/topic/
+!data/topic/**
+!data/dataset_config.yaml

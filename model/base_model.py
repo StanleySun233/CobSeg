@@ -28,16 +28,11 @@ class BaseModel(nn.Module):
         super().__init__()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         object.__setattr__(self, "_runtime_main_encoder", None)
-        object.__setattr__(self, "_runtime_topic_encoder", None)
         self.loop_use_crf = False
 
     @property
     def main_encoder(self) -> nn.Module | None:
         return self._runtime_main_encoder
-
-    @property
-    def topic_encoder(self) -> nn.Module | None:
-        return self._runtime_topic_encoder
 
     def to_device(self):
         return self.to(self.device)
@@ -46,12 +41,10 @@ class BaseModel(nn.Module):
         self,
         *,
         main_encoder: nn.Module | None = None,
-        topic_encoder: nn.Module | None = None,
         use_crf: bool = False,
         device: torch.device | None = None,
     ):
         object.__setattr__(self, "_runtime_main_encoder", main_encoder)
-        object.__setattr__(self, "_runtime_topic_encoder", topic_encoder)
         self.loop_use_crf = bool(use_crf)
         if device is not None:
             self.device = device
@@ -71,34 +64,25 @@ class BaseModel(nn.Module):
             for p in self.main_encoder.parameters():
                 if p.requires_grad:
                     yield p
-        if self.topic_encoder is not None:
-            for p in self.topic_encoder.parameters():
-                if p.requires_grad:
-                    yield p
 
     def count_trainable_parameters(
         self,
         *,
         include_model: bool = True,
         include_main_encoder: bool = True,
-        include_topic_encoder: bool = True,
     ) -> int:
         total = 0
         if include_model:
             total += sum(p.numel() for p in self.parameters() if p.requires_grad)
         if include_main_encoder and self.main_encoder is not None:
             total += sum(p.numel() for p in self.main_encoder.parameters() if p.requires_grad)
-        if include_topic_encoder and self.topic_encoder is not None:
-            total += sum(p.numel() for p in self.topic_encoder.parameters() if p.requires_grad)
         return total
 
     def make_optimizer(
         self,
         model_lr: float,
         main_encoder_lr: float | None = None,
-        topic_encoder_lr: float | None = None,
         include_main_encoder: bool = True,
-        include_topic_encoder: bool = True,
     ) -> torch.optim.Optimizer:
         model_params = [p for p in self.parameters() if p.requires_grad]
         param_groups: list[dict[str, Any]] = []
@@ -109,34 +93,18 @@ class BaseModel(nn.Module):
             encoder_params = [p for p in self.main_encoder.parameters() if p.requires_grad]
             if encoder_params:
                 param_groups.append({"params": encoder_params, "lr": encoder_lr})
-        if include_topic_encoder and self.topic_encoder is not None:
-            topic_lr = model_lr if topic_encoder_lr is None else topic_encoder_lr
-            topic_params = [p for p in self.topic_encoder.parameters() if p.requires_grad]
-            if topic_params:
-                param_groups.append({"params": topic_params, "lr": topic_lr})
         if len(param_groups) <= 1:
             return torch.optim.Adam(model_params, lr=model_lr)
         return torch.optim.AdamW(param_groups)
 
     def save_checkpoint(self, ckpt_path: Path) -> None:
         if self.main_encoder is None:
-            if self.topic_encoder is None:
-                torch.save(self.state_dict(), ckpt_path)
-                return
-            torch.save(
-                {
-                    "model_state": self.state_dict(),
-                    "topic_encoder_state": self.topic_encoder.state_dict(),
-                },
-                ckpt_path,
-            )
+            torch.save(self.state_dict(), ckpt_path)
             return
         payload = {
             "model_state": self.state_dict(),
             "main_encoder_state": self.main_encoder.state_dict(),
         }
-        if self.topic_encoder is not None:
-            payload["topic_encoder_state"] = self.topic_encoder.state_dict()
         torch.save(payload, ckpt_path)
 
     def load_checkpoint(
@@ -144,22 +112,18 @@ class BaseModel(nn.Module):
         ckpt_path: Path,
         *,
         device: torch.device | None = None,
-    ) -> tuple[torch.nn.modules.module._IncompatibleKeys, bool, bool]:
+    ) -> tuple[torch.nn.modules.module._IncompatibleKeys, bool]:
         map_device = self.current_device() if device is None else device
         payload = torch.load(ckpt_path, map_location=map_device)
         encoder_loaded = False
-        topic_loaded = False
         if isinstance(payload, dict) and "model_state" in payload:
             load_res = self.load_state_dict(payload["model_state"], strict=False)
             if self.main_encoder is not None and "main_encoder_state" in payload:
                 self.main_encoder.load_state_dict(payload["main_encoder_state"], strict=False)
                 encoder_loaded = True
-            if self.topic_encoder is not None and "topic_encoder_state" in payload:
-                self.topic_encoder.load_state_dict(payload["topic_encoder_state"], strict=False)
-                topic_loaded = True
-            return load_res, encoder_loaded, topic_loaded
+            return load_res, encoder_loaded
         load_res = self.load_state_dict(payload, strict=False)
-        return load_res, encoder_loaded, topic_loaded
+        return load_res, encoder_loaded
 
     def sync_checkpoint_state(self, load_res) -> None:
         if hasattr(self, "sync_topic_branch_from_sentence"):
@@ -260,36 +224,6 @@ class BaseModel(nn.Module):
         tok_m = attention_mask.to(hidden.device, dtype=hidden.dtype)
         return x_s, x_w, tok_m
 
-    def _encode_topic_batch(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        lengths: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.topic_encoder is None:
-            raise ValueError("topic_encoder is required for dynamic topic batches.")
-        bsz, umax, tok_len = input_ids.shape
-        flat_ids = input_ids.view(bsz * umax, tok_len)
-        flat_mask = attention_mask.view(bsz * umax, tok_len)
-        utt_mask = (
-            torch.arange(umax, device=input_ids.device).unsqueeze(0)
-            < lengths.to(input_ids.device).unsqueeze(1)
-        ).view(-1)
-        valid_ids = flat_ids[utt_mask]
-        valid_mask = flat_mask[utt_mask]
-        out = self.topic_encoder(input_ids=valid_ids, attention_mask=valid_mask)
-        hidden = out.last_hidden_state
-        sent = mean_pool(hidden, valid_mask.float())
-        hidden_dim = hidden.size(-1)
-        x_t = torch.zeros(
-            bsz * umax,
-            hidden_dim,
-            device=hidden.device,
-            dtype=hidden.dtype,
-        )
-        x_t[utt_mask] = sent
-        return x_t.view(bsz, umax, hidden_dim)
-
     def prepare_batch_inputs(
         self,
         batch: tuple,
@@ -315,20 +249,6 @@ class BaseModel(nn.Module):
             kw_scores = kw_scores.to(device)
             return x_s, x_w, tok_m, x_t, labels, lengths, kw_scores, None, None
 
-        if len(batch) == 7 and batch[0].dtype == torch.long:
-            if self.main_encoder is None or self.topic_encoder is None:
-                raise ValueError("Dynamic main/topic batches require both main_encoder and topic_encoder.")
-            input_ids, attention_mask, topic_ids, topic_attention_mask, labels, lengths, kw_scores = batch
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            topic_ids = topic_ids.to(device)
-            topic_attention_mask = topic_attention_mask.to(device)
-            labels = labels.to(device)
-            kw_scores = kw_scores.to(device)
-            x_s, x_w, tok_m = self._encode_main_batch(self.main_encoder, input_ids, attention_mask, lengths)
-            x_t = self._encode_topic_batch(topic_ids, topic_attention_mask, lengths)
-            return x_s, x_w, tok_m, x_t, labels, lengths, kw_scores, None, None
-
         if len(batch) == 8:
             if self.main_encoder is None:
                 raise ValueError("main_encoder is required for NSP cross-encoder batches.")
@@ -341,34 +261,6 @@ class BaseModel(nn.Module):
             labels = labels.to(device)
             kw_scores = kw_scores.to(device)
             x_s, x_w, tok_m = self._encode_main_batch(self.main_encoder, input_ids, attention_mask, lengths)
-            return x_s, x_w, tok_m, x_t, labels, lengths, kw_scores, pair_ids, pair_attention_mask
-
-        if len(batch) == 9:
-            if self.main_encoder is None or self.topic_encoder is None:
-                raise ValueError(
-                    "Dynamic main/topic + NSP batches require both main_encoder and topic_encoder."
-                )
-            (
-                input_ids,
-                attention_mask,
-                pair_ids,
-                pair_attention_mask,
-                topic_ids,
-                topic_attention_mask,
-                labels,
-                lengths,
-                kw_scores,
-            ) = batch
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            pair_ids = pair_ids.to(device)
-            pair_attention_mask = pair_attention_mask.to(device)
-            topic_ids = topic_ids.to(device)
-            topic_attention_mask = topic_attention_mask.to(device)
-            labels = labels.to(device)
-            kw_scores = kw_scores.to(device)
-            x_s, x_w, tok_m = self._encode_main_batch(self.main_encoder, input_ids, attention_mask, lengths)
-            x_t = self._encode_topic_batch(topic_ids, topic_attention_mask, lengths)
             return x_s, x_w, tok_m, x_t, labels, lengths, kw_scores, pair_ids, pair_attention_mask
 
         if len(batch) == 6:
@@ -727,8 +619,6 @@ class BaseModel(nn.Module):
         self.train()
         if self.main_encoder is not None:
             self.main_encoder.train()
-        if self.topic_encoder is not None:
-            self.topic_encoder.train()
         keys = ("loss", "main", "aux")
         acc = {k: 0.0 for k in keys}
         pbar = tqdm(loader, desc=f"stage1 {epoch}/{epochs}", leave=True, dynamic_ncols=True)
@@ -758,8 +648,6 @@ class BaseModel(nn.Module):
         self.eval()
         if self.main_encoder is not None:
             self.main_encoder.eval()
-        if self.topic_encoder is not None:
-            self.topic_encoder.eval()
         keys = ("loss", "main", "aux")
         acc = {k: 0.0 for k in keys}
         nbatch = max(len(loader), 1)
@@ -784,8 +672,6 @@ class BaseModel(nn.Module):
         self.train()
         if self.main_encoder is not None:
             self.main_encoder.train()
-        if self.topic_encoder is not None:
-            self.topic_encoder.train()
         keys = ("loss", "main", "end", "start", "rank", "coh", "nsp", "ubiw")
         acc = {k: 0.0 for k in keys}
         pbar = tqdm(loader, desc=f"train {epoch}/{epochs}", leave=True, dynamic_ncols=True)
@@ -819,8 +705,6 @@ class BaseModel(nn.Module):
         self.eval()
         if self.main_encoder is not None:
             self.main_encoder.eval()
-        if self.topic_encoder is not None:
-            self.topic_encoder.eval()
         keys = ("loss", "main", "end", "start", "rank", "coh", "nsp", "ubiw")
         acc = {k: 0.0 for k in keys}
         nbatch = max(len(loader), 1)
@@ -844,8 +728,6 @@ class BaseModel(nn.Module):
         self.eval()
         if self.main_encoder is not None:
             self.main_encoder.eval()
-        if self.topic_encoder is not None:
-            self.topic_encoder.eval()
         all_preds: list[list[int]] = []
         all_labels: list[list[int]] = []
 
@@ -891,8 +773,6 @@ class BaseModel(nn.Module):
         self.eval()
         if self.main_encoder is not None:
             self.main_encoder.eval()
-        if self.topic_encoder is not None:
-            self.topic_encoder.eval()
         all_preds: list[list[int]] = []
         all_labels: list[list[int]] = []
 
@@ -941,12 +821,10 @@ class BaseModel(nn.Module):
         include_results_json: bool = True,
     ) -> tuple[dict[str, float] | None, dict[str, float]]:
         print(f"Loading checkpoint: {ckpt_path}")
-        load_res, encoder_loaded, topic_loaded = self.load_checkpoint(ckpt_path)
+        load_res, encoder_loaded = self.load_checkpoint(ckpt_path)
         self.sync_checkpoint_state(load_res)
         if self.main_encoder is not None and not encoder_loaded:
             print("[warn] checkpoint does not contain main encoder weights; using base encoder init.")
-        if self.topic_encoder is not None and not topic_loaded:
-            print("[warn] checkpoint does not contain topic encoder weights; using topic encoder init.")
 
         metrics_val = None
         if val_loader is not None:
@@ -1016,25 +894,14 @@ class BaseModel(nn.Module):
         results_path = ckpt_dir / "results.json"
 
         stage1_info = None
-        stage1_train_topic = bool(
-            getattr(cfg, "stage1_finetune_topic_encoder", False)
-            or getattr(cfg, "finetune_topic_encoder", False)
-        )
-        stage2_train_topic = bool(getattr(cfg, "finetune_topic_encoder", False))
         if getattr(cfg, "two_stage_training", False) and int(getattr(cfg, "stage1_epochs", 0)) > 0:
             if getattr(cfg, "use_nsp_cross_encoder", False):
                 print("\n--- Stage 1: RoBERTa pair cross-encoder warmup ---")
             else:
                 print("\n--- Stage 1: transition-aware representation warmup ---")
-            if self.topic_encoder is not None:
-                self.topic_encoder.requires_grad_(stage1_train_topic)
             stage1_optimizer = self.make_optimizer(
                 float(getattr(cfg, "stage1_lr", self.default_lr)),
                 main_encoder_lr=float(getattr(cfg, "stage1_main_encoder_lr", getattr(cfg, "stage1_lr", self.default_lr))),
-                topic_encoder_lr=float(
-                    getattr(cfg, "stage1_topic_encoder_lr", getattr(cfg, "stage1_lr", self.default_lr))
-                ),
-                include_topic_encoder=stage1_train_topic,
             )
             stage1_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 stage1_optimizer,
@@ -1099,34 +966,25 @@ class BaseModel(nn.Module):
                     )
                     break
 
-            load_res, encoder_loaded, topic_loaded = self.load_checkpoint(stage1_ckpt_path)
+            load_res, encoder_loaded = self.load_checkpoint(stage1_ckpt_path)
             self.sync_checkpoint_state(load_res)
             if self.main_encoder is not None and not encoder_loaded:
                 print("[warn] stage1 checkpoint does not contain main encoder weights; using base encoder init.")
-            if self.topic_encoder is not None and not topic_loaded:
-                print("[warn] stage1 checkpoint does not contain topic encoder weights; using topic encoder init.")
             stage1_info = {
                 "mode": "nsp_cross_encoder" if getattr(cfg, "use_nsp_cross_encoder", False) else "transition_repr",
                 "best_pk": best_stage1_pk,
                 "best_score": best_stage1_score,
                 "epochs": stage1_epochs,
                 "ckpt": str(stage1_ckpt_path),
-                "topic_encoder_finetuned": stage1_train_topic,
             }
             print(
                 f"Stage1 loaded best checkpoint from {stage1_ckpt_path}  "
                 f"(Val PK={best_stage1_pk:.4f})"
             )
 
-        if self.topic_encoder is not None:
-            self.topic_encoder.requires_grad_(stage2_train_topic)
         optimizer = self.make_optimizer(
             float(getattr(cfg, "lr", self.default_lr)),
             main_encoder_lr=float(getattr(cfg, "main_encoder_lr", getattr(cfg, "lr", self.default_lr))),
-            topic_encoder_lr=float(
-                getattr(cfg, "topic_encoder_lr", getattr(cfg, "lr", self.default_lr))
-            ),
-            include_topic_encoder=stage2_train_topic,
         )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,

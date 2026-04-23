@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 import yaml
@@ -29,52 +29,60 @@ from utils.utils import resolve_dataset_path
 CS_ENCODER_NAME = "princeton-nlp/sup-simcse-bert-base-uncased"
 
 
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value!r}")
+
 @dataclass
 class ExperimentConfig:
-    model_name: str
-    dataset: str
-    encoder: str
-    emb_batch: int
-    epochs: int
-    batch_size: int
-    seed: int
-    lr: float
-    lr_patience: int
-    lr_factor: float
-    min_lr: float
-    early_stop: int
-    num_samples: int
-    eval_only: bool
-    exp_name: str
-    stream_mode: str
-    disable_token_transformer: bool
-    disable_crf: bool
-    disable_ubiw: bool
-    topic_json_path: str
-    rank_loss_weight: float
-    rank_margin: float
-    rank_kw_gap: float
-    end_loss_weight: float
-    start_loss_weight: float
-    edge_gate_alpha: float
-    edge_gate_gamma: float
-    ubiw_aux_weight: float
-    ubiw_aux_tau: float
-    coh_aux_weight: float
-    finetune_main_encoder: bool
-    main_encoder_lr: float
-    two_stage_training: bool
-    stage1_epochs: int
-    stage1_lr: float
-    stage1_main_encoder_lr: float
-    stage1_aux_weight: float
-    finetune_topic_encoder: bool
-    topic_encoder_lr: float
-    stage1_finetune_topic_encoder: bool
-    stage1_topic_encoder_lr: float
-    use_nsp_cross_encoder: bool
-    nsp_max_pair_tokens: int
-    nsp_stage2_aux_weight: float
+    model_name: str = "dud"
+    dataset: str = "vhf"
+    exp_name: str = "baseline"
+    encoder: str = "roberta-base"
+    emb_batch: int = 32
+    epochs: int = 50
+    batch_size: int = 4
+    seed: int = 42
+    lr: float = BaseModel.default_lr
+    lr_patience: int = BaseModel.default_lr_patience
+    lr_factor: float = BaseModel.default_lr_factor
+    min_lr: float = BaseModel.default_min_lr
+    early_stop: int = BaseModel.default_early_stop
+    num_samples: int = -1
+    eval_only: bool = False
+    stream_mode: str = "dual"
+    disable_token_transformer: bool = False
+    disable_crf: bool = False
+    disable_ubiw: bool = False
+    topic_json_path: str = "./data/topic/topic_keywords.json"
+    rank_loss_weight: float = 0.2
+    rank_margin: float = 0.1
+    rank_kw_gap: float = 0.05
+    end_loss_weight: float = 1.0
+    start_loss_weight: float = 1.0
+    edge_gate_alpha: float = 0.25
+    edge_gate_gamma: float = 1.5
+    ubiw_aux_weight: float = 0.2
+    ubiw_aux_tau: float = 2.0
+    coh_aux_weight: float = 0.2
+    finetune_main_encoder: bool = True
+    main_encoder_lr: float = 2e-5
+    two_stage_training: bool = True
+    stage1_epochs: int = 5
+    stage1_lr: float = 5e-4
+    stage1_main_encoder_lr: float = 2e-5
+    stage1_aux_weight: float = 0.5
+    use_nsp_cross_encoder: bool = True
+    nsp_max_pair_tokens: int = 0
+    nsp_stage2_aux_weight: float = 0.2
+    train_subset_count: int = 0
+    train_subset_seed: int = 42
 
 
 _DATASET_CFG_CACHE: dict = {}
@@ -194,6 +202,16 @@ def _load_topic_channels(topic_json_path: str, dataset: str) -> dict[str, set[st
     return topic_channels_by_ds.get(dataset, topic_channel_sets_from_info({}))
 
 
+def _select_train_subset(train_dialogues: list, subset_count: int, subset_seed: int) -> list:
+    if subset_count <= 0 or subset_count >= len(train_dialogues):
+        return train_dialogues
+
+    rng = np.random.default_rng(subset_seed)
+    order = rng.permutation(len(train_dialogues))
+    chosen = sorted(order[:subset_count].tolist())
+    return [train_dialogues[idx] for idx in chosen]
+
+
 def run_single(cfg: ExperimentConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -202,11 +220,6 @@ def run_single(cfg: ExperimentConfig) -> None:
         raise SystemExit(
             "--use_nsp_cross_encoder requires --finetune_main_encoder so the "
             "stage1 RoBERTa cross-encoder can be reused in stage-2."
-        )
-    if (cfg.finetune_topic_encoder or cfg.stage1_finetune_topic_encoder) and not cfg.finetune_main_encoder:
-        raise SystemExit(
-            "--finetune_topic_encoder / --stage1_finetune_topic_encoder currently require "
-            "--finetune_main_encoder so main/topic branches stay on the same dynamic path."
         )
     if cfg.use_nsp_cross_encoder and cfg.model_name != "dud":
         raise SystemExit("--use_nsp_cross_encoder is currently only supported with --model_name dud.")
@@ -237,6 +250,25 @@ def run_single(cfg: ExperimentConfig) -> None:
     test_dialogues = [d for d in full_dataset if d.set == "test"]
     print(f"Train: {len(train_dialogues)}  Valid: {len(val_dialogues)}  Test: {len(test_dialogues)}")
 
+    original_train_count = len(train_dialogues)
+    if cfg.train_subset_count > 0:
+        if cfg.train_subset_count > original_train_count:
+            raise SystemExit(
+                f"--train_subset_count={cfg.train_subset_count} exceeds available "
+                f"train dialogues ({original_train_count})."
+            )
+        train_dialogues = _select_train_subset(
+            train_dialogues,
+            subset_count=cfg.train_subset_count,
+            subset_seed=cfg.train_subset_seed,
+        )
+        pct = 100.0 * len(train_dialogues) / max(original_train_count, 1)
+        print(
+            "Using supervised train subset: "
+            f"{len(train_dialogues)}/{original_train_count} dialogues "
+            f"({pct:.2f}% of train split, seed={cfg.train_subset_seed})"
+        )
+
     print(f"Loading main encoder: {cfg.encoder}")
     tokenizer, enc_model = _load_hf_encoder(
         cfg.encoder,
@@ -244,27 +276,21 @@ def run_single(cfg: ExperimentConfig) -> None:
         eval_mode=not cfg.finetune_main_encoder,
     )
     enc_model.requires_grad_(cfg.finetune_main_encoder)
-
     print(f"Loading CS encoder: {CS_ENCODER_NAME}")
-    dynamic_topic_encoder = cfg.finetune_topic_encoder or cfg.stage1_finetune_topic_encoder
-    cs_tokenizer, cs_enc_model = _load_hf_encoder(
-        CS_ENCODER_NAME,
-        device,
-        eval_mode=not dynamic_topic_encoder,
-    )
-    cs_enc_model.requires_grad_(dynamic_topic_encoder)
+    cs_tokenizer, cs_enc_model = _load_hf_encoder(CS_ENCODER_NAME, device, eval_mode=True)
+    cs_enc_model.requires_grad_(False)
+
     topic_channels = _load_topic_channels(cfg.topic_json_path, cfg.dataset)
 
     dataset_kw = dict(
+        cs_enc_model=cs_enc_model,
+        cs_tokenizer=cs_tokenizer,
         batch_size=cfg.emb_batch,
         max_utterances=max_utterances,
         max_utt_tokens=max_utt_tokens,
         dataset_name=cfg.dataset,
         topic_channels=topic_channels,
-        cs_enc_model=cs_enc_model,
-        cs_tokenizer=cs_tokenizer,
         finetune_main_encoder=cfg.finetune_main_encoder,
-        finetune_topic_encoder=dynamic_topic_encoder,
         use_nsp_cross_encoder=cfg.use_nsp_cross_encoder,
         nsp_max_pair_tokens=nsp_max_pair_tokens,
     )
@@ -337,7 +363,6 @@ def run_single(cfg: ExperimentConfig) -> None:
     main_encoder = enc_model if cfg.finetune_main_encoder else None
     model.configure_runtime(
         main_encoder=main_encoder,
-        topic_encoder=cs_enc_model if dynamic_topic_encoder else None,
         use_crf=use_crf,
         device=device,
     )
@@ -348,13 +373,12 @@ def run_single(cfg: ExperimentConfig) -> None:
         print(f"Train token pos_weight (neg/pos): {pos_w:.4f}")
 
     total_params = model.count_trainable_parameters()
-    if main_encoder is not None or dynamic_topic_encoder:
-        seg_params = model.count_trainable_parameters(include_main_encoder=False, include_topic_encoder=False)
-        enc_params = model.count_trainable_parameters(include_model=False, include_topic_encoder=False)
-        topic_params = model.count_trainable_parameters(include_model=False, include_main_encoder=False)
+    if main_encoder is not None:
+        seg_params = model.count_trainable_parameters(include_main_encoder=False)
+        enc_params = model.count_trainable_parameters(include_model=False)
         print(
             f"Trainable parameters: total={total_params:,}  "
-            f"segmenter={seg_params:,}  main_encoder={enc_params:,}  topic_encoder={topic_params:,}"
+            f"segmenter={seg_params:,}  main_encoder={enc_params:,}"
         )
     else:
         print(f"Trainable parameters: {total_params:,}")
@@ -371,62 +395,31 @@ def run_single(cfg: ExperimentConfig) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DTS training entry (unified)")
-    parser.add_argument("--model_name", default="dud", choices=("dud", "bert"))
-    parser.add_argument(
-        "--dataset",
-        default="vhf",
-        help="vhf | dialseg711 | doc2dial | tiage | superseg, or path to a .json dialogue file",
-    )
-    parser.add_argument("--encoder", default="BAAI/bge-m3")
-    parser.add_argument("--emb_batch", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--lr", type=float, default=BaseModel.default_lr)
-    parser.add_argument("--lr_patience", type=int, default=BaseModel.default_lr_patience)
-    parser.add_argument("--lr_factor", type=float, default=BaseModel.default_lr_factor)
-    parser.add_argument("--min_lr", type=float, default=BaseModel.default_min_lr)
-    parser.add_argument("--early_stop", type=int, default=BaseModel.default_early_stop)
-    parser.add_argument("--num_samples", type=int, default=-1)
-    parser.add_argument("--eval_only", action="store_true")
-    parser.add_argument("--exp_name", type=str, default="baseline")
-
-    parser.add_argument("--stream_mode", choices=("dual", "sentence", "token"), default="dual")
-    parser.add_argument("--disable_token_transformer", action="store_true")
-    parser.add_argument("--disable_crf", action="store_true")
-    parser.add_argument("--disable_ubiw", action="store_true")
-    parser.add_argument("--topic_json_path", type=str, default="./data/topic/topic_keywords.json")
-    parser.add_argument("--rank_loss_weight", type=float, default=0.2)
-    parser.add_argument("--rank_margin", type=float, default=0.1)
-    parser.add_argument("--rank_kw_gap", type=float, default=0.05)
-    parser.add_argument("--end_loss_weight", type=float, default=1.0)
-    parser.add_argument("--start_loss_weight", type=float, default=1.0)
-    parser.add_argument("--edge_gate_alpha", type=float, default=0.25)
-    parser.add_argument("--edge_gate_gamma", type=float, default=1.5)
-    parser.add_argument("--ubiw_aux_weight", type=float, default=0.2)
-    parser.add_argument("--ubiw_aux_tau", type=float, default=2.0)
-    parser.add_argument("--coh_aux_weight", type=float, default=0.2)
-    parser.add_argument("--finetune_main_encoder", action="store_true")
-    parser.add_argument("--main_encoder_lr", type=float, default=2e-5)
-    parser.add_argument("--two_stage_training", action="store_true")
-    parser.add_argument("--stage1_epochs", type=int, default=5)
-    parser.add_argument("--stage1_lr", type=float, default=5e-4)
-    parser.add_argument("--stage1_main_encoder_lr", type=float, default=2e-5)
-    parser.add_argument("--stage1_aux_weight", type=float, default=0.5)
-    parser.add_argument("--finetune_topic_encoder", action="store_true")
-    parser.add_argument("--topic_encoder_lr", type=float, default=2e-5)
-    parser.add_argument("--stage1_finetune_topic_encoder", action="store_true")
-    parser.add_argument("--stage1_topic_encoder_lr", type=float, default=2e-5)
-    parser.add_argument("--use_nsp_cross_encoder", action="store_true")
-    parser.add_argument("--nsp_max_pair_tokens", type=int, default=0)
-    parser.add_argument("--nsp_stage2_aux_weight", type=float, default=0.2)
+    parser = argparse.ArgumentParser()
+    for field in fields(ExperimentConfig):
+        arg_name = f"--{field.name}"
+        default = field.default
+        if field.name == "model_name":
+            parser.add_argument(arg_name, default=default, choices=("dud", "bert"))
+        elif isinstance(default, bool):
+            parser.add_argument(
+                arg_name,
+                nargs="?",
+                const=True,
+                default=default,
+                type=_parse_bool,
+            )
+        elif isinstance(default, int):
+            parser.add_argument(arg_name, type=int, default=default)
+        elif isinstance(default, float):
+            parser.add_argument(arg_name, type=float, default=default)
+        else:
+            parser.add_argument(arg_name, type=str, default=default)
     args = parser.parse_args()
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
     cfg = ExperimentConfig(**vars(args))
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
     run_single(cfg)
 
 

@@ -1,65 +1,43 @@
-python /home/sijin/maritime/dts/inference.py \
+```bash
+python inference.py \
   --model_name dud \
-  --dataset tiage \
-  --encoder roberta-base \
-  --exp_name cs_score
+  --dataset superseg \
+  --exp_name dud_nsp_twostage
+```
 
-# Unfreeze the main RoBERTa/BERT branch so utterance hierarchy vectors are fine-tuned.
-python /home/sijin/maritime/dts/inference.py \
-  --model_name dud \
-  --dataset tiage \
-  --encoder roberta-base \
-  --finetune_main_encoder \
-  --main_encoder_lr 2e-5 \
-  --exp_name cs_score_ft
+固定训练配置已经写死在 `inference.py`：
 
-# Two-stage DUD: stage1 warms up transition-aware RoBERTa representations,
-# stage2 trains the full DUD decoder on top.
-python /home/sijin/maritime/dts/inference.py \
-  --model_name dud \
-  --dataset tiage \
-  --encoder roberta-base \
-  --finetune_main_encoder \
-  --main_encoder_lr 2e-5 \
-  --two_stage_training \
-  --stage1_epochs 5 \
-  --stage1_lr 5e-4 \
-  --stage1_main_encoder_lr 2e-5 \
-  --stage1_aux_weight 0.5 \
-  --exp_name cs_score_ft_stage2
+- `encoder=roberta-base`
+- `finetune_main_encoder=True`
+- `two_stage_training=True`
+- `use_nsp_cross_encoder=True`
+- `stage1_epochs=5`
+- `stage1_lr=5e-4`
+- `stage1_main_encoder_lr=2e-5`
+- `nsp_stage2_aux_weight=0.2`
 
-# True RoBERTa NSP-style cross-encoder in stage1:
-# adjacent utterance pairs are jointly encoded, then the learned pair embedding
-# and boundary probability are injected back into stage2 DUD.
-python /home/sijin/maritime/dts/inference.py \
-  --model_name dud \
-  --dataset tiage \
-  --encoder roberta-base \
-  --finetune_main_encoder \
-  --main_encoder_lr 2e-5 \
-  --two_stage_training \
-  --use_nsp_cross_encoder \
-  --stage1_epochs 5 \
-  --stage1_lr 5e-4 \
-  --stage1_main_encoder_lr 2e-5 \
-  --nsp_stage2_aux_weight 0.2 \
-  --exp_name cs_score_ft_nsp_stage2
+也就是说：
 
-# Also fine-tune the SIM/topic branch in stage1.
-# Here stage1 updates both the main RoBERTa pair branch and the SimCSE/topic branch;
-# stage2 keeps the topic encoder frozen unless --finetune_topic_encoder is added.
-python /home/sijin/maritime/dts/inference.py \
+1. 第一阶段默认训练 RoBERTa NSP cross-encoder
+2. 第一阶段最佳 checkpoint 默认作为第二阶段初始化
+3. 第二阶段默认训练完整 DUD 下游分割
+
+监督数据比例实验可以用单独脚本跑：
+
+```bash
+python scripts/run_supervision_sweep.py \
+  --dataset superseg \
+  --baseline_json checkpoints/superseg/nsp_texttiling/results.json \
+  --exp_prefix sup_vs_unsup \
   --model_name dud \
-  --dataset tiage \
   --encoder roberta-base \
-  --finetune_main_encoder \
-  --main_encoder_lr 2e-5 \
-  --two_stage_training \
-  --use_nsp_cross_encoder \
-  --stage1_epochs 5 \
-  --stage1_lr 5e-4 \
-  --stage1_main_encoder_lr 2e-5 \
-  --stage1_finetune_topic_encoder \
-  --stage1_topic_encoder_lr 2e-5 \
-  --nsp_stage2_aux_weight 0.2 \
-  --exp_name cs_score_ft_nsp_stage1_topic
+  --epochs 50
+```
+
+说明：
+
+- 脚本按“先划分，再在 train split 内抽样”解释比例
+- 默认比例为 `1%, 3%, 5%, 10%, 25%, 50%, 75%`
+- `train/valid/test` 切分不变，只对子采样 `train`
+- 默认比较 `test.Score` 是否达到 `--baseline_json` 中的无监督结果
+- 汇总结果默认写到 `data/experiments/<dataset>_<exp_prefix>.csv`
