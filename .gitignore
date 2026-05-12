@@ -188,6 +188,10 @@ __marimo__/
 # Project-specific
 .codex/
 
+# Environment variables
+.env
+.env.local
+
 # Numba cache
 *.nbc
 *.nbi
@@ -207,6 +211,7 @@ Thumbs.db
 
 # Logs
 logs/
+*.csv
 
 # Temporary files
 *.tmp
@@ -223,3 +228,10 @@ data/*
 !data/topic/
 !data/topic/**
 !data/dataset_config.yaml
+
+# Generated pseudo-label datasets and artifacts
+data/dataset/*_pseudo_*.json
+data/dataset/*_pseudo_*_artifacts/
+data/dataset/*_weak_*_artifacts/
+
+/scripts/output

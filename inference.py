@@ -1,7 +1,7 @@
 import argparse
 import json
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoModel, AutoTokenizer
 
 from model.base_model import BaseModel
-from model.dud import DUD
+from model.cobseg import CobSeg
 from model.bert_dts import PureBertSegmenter
 from utils.dialogue_dataset import DialogueDataset
 from utils.dts_data import (
@@ -29,25 +29,16 @@ from utils.utils import resolve_dataset_path
 CS_ENCODER_NAME = "princeton-nlp/sup-simcse-bert-base-uncased"
 
 
-def _parse_bool(value):
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "t", "yes", "y", "on"}:
-        return True
-    if text in {"0", "false", "f", "no", "n", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value!r}")
 
 @dataclass
 class ExperimentConfig:
-    model_name: str = "dud"
+    model_name: str = "cobseg"
     dataset: str = "vhf"
     exp_name: str = "baseline"
     encoder: str = "roberta-base"
-    emb_batch: int = 32
+    emb_batch: int = 16
     epochs: int = 50
-    batch_size: int = 4
+    batch_size: int = 2
     seed: int = 42
     lr: float = BaseModel.default_lr
     lr_patience: int = BaseModel.default_lr_patience
@@ -125,8 +116,8 @@ def compute_pos_weight(dataset: EmbeddedDialogueDataset) -> float:
 
 
 def build_model(cfg: ExperimentConfig, input_dim: int, max_utt_tokens: int) -> tuple[BaseModel, bool]:
-    if cfg.model_name == "dud":
-        model = DUD(
+    if cfg.model_name == "cobseg":
+        model = CobSeg(
             input_dim=input_dim,
             max_utt_tokens=max_utt_tokens,
             stream_mode=cfg.stream_mode,
@@ -221,8 +212,8 @@ def run_single(cfg: ExperimentConfig) -> None:
             "--use_nsp_cross_encoder requires --finetune_main_encoder so the "
             "stage1 RoBERTa cross-encoder can be reused in stage-2."
         )
-    if cfg.use_nsp_cross_encoder and cfg.model_name != "dud":
-        raise SystemExit("--use_nsp_cross_encoder is currently only supported with --model_name dud.")
+    if cfg.use_nsp_cross_encoder and cfg.model_name != "cobseg":
+        raise SystemExit("--use_nsp_cross_encoder is currently only supported with --model_name cobseg.")
 
     max_utt_tokens, max_utterances = resolve_dataset_limits(cfg.dataset)
     nsp_max_pair_tokens = (
@@ -392,32 +383,28 @@ def run_single(cfg: ExperimentConfig) -> None:
         test_dialogues=test_dialogues,
         max_utterances=max_utterances,
     )
-
-
 def main():
     parser = argparse.ArgumentParser()
-    for field in fields(ExperimentConfig):
-        arg_name = f"--{field.name}"
-        default = field.default
-        if field.name == "model_name":
-            parser.add_argument(arg_name, default=default, choices=("dud", "bert"))
-        elif isinstance(default, bool):
-            parser.add_argument(
-                arg_name,
-                nargs="?",
-                const=True,
-                default=default,
-                type=_parse_bool,
-            )
-        elif isinstance(default, int):
-            parser.add_argument(arg_name, type=int, default=default)
-        elif isinstance(default, float):
-            parser.add_argument(arg_name, type=float, default=default)
-        else:
-            parser.add_argument(arg_name, type=str, default=default)
+    parser.add_argument("--model_name", default="cobseg", choices=["cobseg", "bert"])
+    parser.add_argument("--dataset", default="vhf")
+    parser.add_argument("--exp_name", default="baseline")
+    parser.add_argument("--encoder", default="roberta-base")
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--emb_batch", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    cfg = ExperimentConfig(**vars(args))
+    cfg = ExperimentConfig(
+        model_name=args.model_name,
+        dataset=args.dataset,
+        exp_name=args.exp_name,
+        encoder=args.encoder,
+        batch_size=args.batch_size,
+        emb_batch=args.emb_batch,
+        epochs=args.epochs,
+        seed=args.seed,
+    )
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     run_single(cfg)
