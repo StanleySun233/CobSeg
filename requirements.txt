@@ -1,0 +1,8 @@
+pyyaml
+transformers
+python-dotenv
+pandas
+scikit-learn
+segeval
+pytorch-crf
+openai
